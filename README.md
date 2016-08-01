@@ -1,0 +1,2 @@
+# fake_game_server
+用fakescript脚本写的服务器框架
