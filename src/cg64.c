@@ -2484,18 +2484,16 @@ static int outgoing_stack_bytes(C64 *c, const IRInst *s) {
             continue;
         }
         int cpy = call_arg_copy_bytes(s, i);
-        /* AAPCS64 C.12: a composite larger than 16 bytes is passed
-         * indirectly -- the slot holds a pointer to it, which is what the
-         * callee's va_arg expects.  Only up-to-16-byte objects travel
-         * inline. */
-        if (cpy > 16) cpy = 0;
         if (cpy) {
             /* Must match the reservation in the call sequence exactly, or the
              * outgoing area comes out smaller than the callee expects and the
-             * object lands somewhere the callee never looks. */
+             * object lands somewhere the callee never looks.  The slot's start
+             * is rounded up to the argument's own alignment either way -- an
+             * indirect (wider-than-16) argument is a pointer in that slot,
+             * and va_arg still aligns before reading it. */
             int al = copy_arg_align((unsigned char)f);
             if (al > 8 && (st % al)) st = (st + al - 1) & ~(al - 1);
-            st += (cpy + 7) & ~7;      /* slots are 8-byte granular */
+            st += (cpy > 16) ? 8 : ((cpy + 7) & ~7);
         } else if ((f & CALL_ARG_STACK) || gp >= 8 || scalar || qv) {
             if (qv) {
                 if (st & 15) st = (st + 15) & ~15;
@@ -3350,17 +3348,19 @@ static void emit_call(C64 *c, const IRInst *s) {
         int scalar = scalar_fp_val(c, s->call_args[i]);
         int qv = vec16_val(c, s->call_args[i]);
         int cpyb = call_arg_copy_bytes(s, i);
-        if (cpyb > 16) cpyb = 0;    /* indirect: the normal pointer store */
         if (cpyb) {
-            /* An object that reaches memory behind a pointer: reserve its
-             * bytes here and copy it before the GP shuffle (see the loop
-             * after the stack-argument stores). */
+            /* An object that reaches memory behind a pointer.  Wider than 16
+             * bytes it is passed *indirectly* -- AAPCS64 C.12 -- so the slot
+             * holds the pointer and the ordinary stack store below writes it.
+             * Up to 16 bytes it is copied inline before the GP shuffle (see
+             * the loop after the stack-argument stores). */
             int al = copy_arg_align((unsigned char)f);
             if (al > 8 && (stk_bytes % al))
                 stk_bytes = (stk_bytes + al - 1) & ~(al - 1);
+            if (cpyb > 16) cpyb = 0;    /* indirect from here on */
             stk_at[stk_n] = i;
             stk_off[stk_n] = stk_bytes;
-            stk_bytes += (cpyb + 7) & ~7;  /* slots are 8-byte granular */
+            stk_bytes += cpyb ? ((cpyb + 7) & ~7) : 8;
             stk_n++;
             st_used++;
             continue;

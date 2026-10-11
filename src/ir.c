@@ -7932,7 +7932,13 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
                  * else.  Structs suffered the same way. */
                 if (darwin_unnamed_va(call_real_variadic, i, call_nparams,
                                       call_fake_variadic)) {
-                    if (asz <= 0) asz = 8;
+                    if (asz <= 0) {
+                        /* A zero-sized aggregate consumes no slot at all --
+                         * gcc agrees, and ir.c's va_arg already skips those,
+                         * so reserving one here would shift every argument
+                         * after it. */
+                        continue;
+                    }
                     if (nargs >= arg_limit) {
                         fprintf(stderr, "fakecc: too many call arguments (max %d)\n",
                                 IR_CALL_MAX_ARGS);
