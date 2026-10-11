@@ -75,10 +75,21 @@ static void test_elf_machine(void) {
     unlink(out);
 }
 
-static void test_run_return_0(void) {
-    const char *out = "/tmp/fakecc_test_run_0";
-    compile_to_file("package main; int main() { return 0; }", out);
+/* The run-execution cases fork/exec a real x86-64 Linux process, so they
+ * can only be exercised natively on an x86-64 Linux host.  Everywhere else
+ * (Darwin arm64, Linux aarch64, ...) the artifacts are still produced --
+ * the magic/machine checks cover codegen+emission -- but executing them
+ * would just fail with ENOEXEC; those cases report SKIP instead. */
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+#define HOST_RUNS_X86_64_LINUX_ELF 1
+#else
+#define HOST_RUNS_X86_64_LINUX_ELF 0
+#endif
 
+/* Run an emitted executable and return its exit status (-1 if it did not
+ * exit normally).  Assumes the caller already verified host support. */
+#if HOST_RUNS_X86_64_LINUX_ELF
+static int run_elf_exit_code(const char *out) {
     int pid = fork();
     if (pid == 0) {
         execl(out, out, (char *)NULL);
@@ -86,8 +97,28 @@ static void test_run_return_0(void) {
     }
     int status;
     waitpid(pid, &status, 0);
-    int got = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    T_ASSERT_EQ_INT(got, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+
+/* Compile on every host (that exercises the whole emit pipeline); only
+ * execute where the kernel can load the artifact. */
+#if HOST_RUNS_X86_64_LINUX_ELF
+#define RUN_ELF_CASE(out, expect) \
+    T_ASSERT_EQ_INT(run_elf_exit_code(out), (expect))
+#else
+#define RUN_ELF_CASE(out, expect) do {                                       \
+    (void)(expect);                                                          \
+    printf("  SKIP run-exec %s (x86-64 Linux ELF needs a Linux x86-64 "      \
+           "host)\n", (out));                                                \
+} while (0)
+#endif
+
+static void test_run_return_0(void) {
+    const char *out = "/tmp/fakecc_test_run_0";
+    compile_to_file("package main; int main() { return 0; }", out);
+
+    RUN_ELF_CASE(out, 0);
     unlink(out);
 }
 
@@ -95,15 +126,7 @@ static void test_run_return_42(void) {
     const char *out = "/tmp/fakecc_test_run_42";
     compile_to_file("package main; int main() { return 42; }", out);
 
-    int pid = fork();
-    if (pid == 0) {
-        execl(out, out, (char *)NULL);
-        _exit(127);
-    }
-    int status;
-    waitpid(pid, &status, 0);
-    int got = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    T_ASSERT_EQ_INT(got, 42);
+    RUN_ELF_CASE(out, 42);
     unlink(out);
 }
 
@@ -111,23 +134,15 @@ static void test_run_return_255(void) {
     const char *out = "/tmp/fakecc_test_run_255";
     compile_to_file("package main; int main() { return 255; }", out);
 
-    int pid = fork();
-    if (pid == 0) {
-        execl(out, out, (char *)NULL);
-        _exit(127);
-    }
-    int status;
-    waitpid(pid, &status, 0);
-    int got = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    T_ASSERT_EQ_INT(got, 255);
+    RUN_ELF_CASE(out, 255);
     unlink(out);
 }
 
 /* ---- main ---- */
 
 int main(void) {
-    /* Pins the x86-64 ELF backend; the run-execution cases only succeed on a
-     * Linux host (the emitted artifacts are x86-64 ELF by design here). */
+    /* Pins the x86-64 ELF backend; the run-execution cases execute only on
+     * a Linux x86-64 host and report SKIP elsewhere. */
     target_set_current(target_x86_64_linux());
     test_elf_magic();
     test_elf_machine();
