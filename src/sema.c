@@ -2664,9 +2664,15 @@ static void normalize_init_list(Type *target, Expr *list, SourceLoc loc, int is_
      * zeros are the object's background (emit_zero_bytes / pack_init calloc).
      * Structs still materialize a 0 per member: N is small and overlay /
      * pack_init index members by position. */
+    /* An incomplete or flexible array has length -1; there is no dense array
+     * to build (and calloc((size_t)-1, ...) would overflow). */
+    if (N < 0) {
+        die_at(loc.file, loc.line, loc.col,
+               "initialization of an incomplete array");
+        return;
+    }
     Expr **out = calloc((size_t)N, sizeof(Expr *));
-    if (!out) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }
-    if (target->kind != TY_ARRAY && !target->is_vector) {
+    if (!out) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }    if (target->kind != TY_ARRAY && !target->is_vector) {
         for (int i = 0; i < N; i++)
             out[i] = expr_new_int(0, loc);
     }
