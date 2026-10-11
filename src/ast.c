@@ -787,6 +787,21 @@ int type_long_double_width(void) {
     return 16;
 }
 
+/* On Darwin arm64 this is plain `double` in every respect that matters to
+ * codegen -- same width, same ABI class, same instructions -- but C keeps it
+ * a distinct type, and so does clang:
+ *
+ *   $ cc -x c - <<< '__builtin_types_compatible_p(long double, double)'
+ *   0
+ *
+ * The width alone cannot answer that, hence the flag.
+ */
+Type type_make_long_double(void) {
+    Type t = type_make_float(type_long_double_width());
+    t.is_long_double = 1;
+    return t;
+}
+
 int abi_gp_nregs(void) {
     const TargetDesc *t = target_current();
     if (t && t->gp_arg_regs > 0) return t->gp_arg_regs;

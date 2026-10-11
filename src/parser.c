@@ -1147,7 +1147,7 @@ static Type parse_specifiers_full(Parser *p, int *storage_class) {
         advance(p); /* consume `long` */
         advance(p); /* consume `double` */
         parse_trailing_qualifiers(p, &is_const, &is_volatile, &is_restrict, &is_complex, storage_class, &attr_vec);
-        Type t = type_make_float(type_long_double_width());
+        Type t = type_make_long_double();
         return finish_specifiers(t, is_const, is_volatile, is_restrict, is_complex, attr_vec, p);
     }
     /* GNU decimal floating types: _Decimal32/64/128. */
@@ -2315,7 +2315,11 @@ static int types_compatible_unqual(const Type *a, const Type *b) {
         return (a->width == b->width && a->is_unsigned == b->is_unsigned);
     }
     if (a->kind == TY_FLOAT) {
-        return (a->width == b->width);
+        /* `long double` shares double's width on Darwin arm64, so compare the
+         * specifier too -- the two are not compatible types. */
+        if (a->width != b->width) return 0;
+        return (a->is_decimal == b->is_decimal
+                && a->is_long_double == b->is_long_double);
     }
     if (a->kind == TY_PTR) {
         if (!a->pointee || !b->pointee) return 0;
@@ -2995,7 +2999,7 @@ static Expr *make_imag_literal(Parser *p, const char *text, SourceLoc loc) {
         if (*s == 'f' || *s == 'F') is_float = 1;
         if (*s == 'l' || *s == 'L') is_ld = 1;
     }
-    Type base = is_float ? type_make_float(4) : (is_ld ? type_make_float(type_long_double_width()) : type_make_float(8));
+    Type base = is_float ? type_make_float(4) : (is_ld ? type_make_long_double() : type_make_float(8));
     Type cty = get_or_create_complex_type(p, base);
 
     /* Clean imag string by stripping i/I/j/J */

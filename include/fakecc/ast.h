@@ -41,6 +41,10 @@ struct Type {
     int   bitfield_width; /* 0 = not a bit-field; else width in bits (promotions) */
     int   is_vector;   /* 1 = GCC vector extension (__attribute__((vector_size(N)))) */
     unsigned is_decimal : 1; /* TY_FLOAT: IEEE 754 decimal (_Decimal32/64/128) */
+    unsigned is_long_double : 1; /* TY_FLOAT: the `long double` specifier, even
+                                  * where it shares double's size and
+                                  * representation (Darwin arm64 gives it
+                                  * width 8).  It is still a distinct type. */
 };
 
 static inline Type type_make_int(long long width, int is_unsigned) {
@@ -49,7 +53,8 @@ static inline Type type_make_int(long long width, int is_unsigned) {
     t.pointee = NULL; t.elem_type = NULL; t.length = 0; t.vla_dim = NULL; t.tag = NULL;
     t.func_ret = NULL; t.func_params = NULL; t.func_nparams = 0; t.func_is_variadic = 0;
     t.func_is_unprototyped = 0; t.enum_id = 0;
-    t.bitfield_width = 0; t.is_vector = 0; t.is_decimal = 0; return t;
+    t.bitfield_width = 0; t.is_vector = 0; t.is_decimal = 0;
+    t.is_long_double = 0; return t;
 }
 static inline Type type_make_bool(void) {
     Type t = type_make_int(1, 1);
@@ -63,8 +68,13 @@ static inline Type type_make_float(long long width) {
     t.pointee = NULL; t.elem_type = NULL; t.length = 0; t.vla_dim = NULL; t.tag = NULL;
     t.func_ret = NULL; t.func_params = NULL; t.func_nparams = 0; t.func_is_variadic = 0;
     t.func_is_unprototyped = 0; t.enum_id = 0;
-    t.bitfield_width = 0; t.is_vector = 0; t.is_decimal = 0; return t;
+    t.bitfield_width = 0; t.is_vector = 0; t.is_decimal = 0;
+    t.is_long_double = 0; return t;
 }
+/* The `long double` specifier.  Darwin arm64 hands it double's width and
+ * representation, but it stays a type of its own: clang there answers 0 for
+ * __builtin_types_compatible_p(long double, double), and so must we. */
+Type type_make_long_double(void);
 static inline Type type_make_decimal(long long width) {
     Type t = type_make_float(width);
     t.is_decimal = 1;
@@ -82,7 +92,8 @@ static inline Type type_make_void(void) {
     t.pointee = NULL; t.elem_type = NULL; t.length = 0; t.vla_dim = NULL; t.tag = NULL;
     t.func_ret = NULL; t.func_params = NULL; t.func_nparams = 0; t.func_is_variadic = 0;
     t.func_is_unprototyped = 0; t.enum_id = 0;
-    t.bitfield_width = 0; t.is_vector = 0; t.is_decimal = 0; return t;
+    t.bitfield_width = 0; t.is_vector = 0; t.is_decimal = 0;
+    t.is_long_double = 0; return t;
 }
 
 /* Deep-clone a Type (recursing into pointee/elem_type). */
