@@ -3978,6 +3978,20 @@ static void ldr_q(A64Asm *a, int rt, int rn, int byte_off) {
              | ((rn & 31) << 5) | (rt & 31));
 }
 
+/* Vectors are addressed through a pointer to their storage, so a narrow one
+ * is just a narrower load.  128-bit and narrower live in the same register;
+ * only the width of the transfer differs. */
+static void vec_load(A64Asm *a, int rt, int rn, int width) {
+    if (width == 16) ldr_q(a, rt, rn, 0);
+    else if (width == 8) a64_ldr_d(a, rt, rn, 0);
+    else a64_ldr_s(a, rt, rn, 0);
+}
+static void vec_store(A64Asm *a, int rt, int rn, int width) {
+    if (width == 16) str_q(a, rt, rn, 0);
+    else if (width == 8) a64_str_d(a, rt, rn, 0);
+    else a64_str_s(a, rt, rn, 0);
+}
+
 /* imm5 for UMOV/INS: index shifted above the size marker bit. */
 static int elem_imm5(int esz, int index) {
     int shift = esz == 1 ? 1 : esz == 2 ? 2 : esz == 4 ? 3 : 4;
@@ -4004,23 +4018,28 @@ static void ins_elem(A64Asm *a, int vd, int rn, int esz, int index) {
 static void emit_vec(C64 *c, const IRInst *s) {
     A64Asm *a = c->as;
     int esz = (int)s->imm;
-    if (s->width != 16 || (esz != 1 && esz != 2 && esz != 4 && esz != 8)) {
-        c64_die(c, s, "vector wider than 16");
+    int w = s->width;
+    if ((w != 16 && w != 8 && w != 4) || w < esz
+        || (esz != 1 && esz != 2 && esz != 4 && esz != 8)) {
+        c64_die(c, s, "unsupported vector width");
         return;
     }
     int pa = load_ptrv(c, s->a, -1);
-    ldr_q(a, A64_V30, pa, 0);
+    vec_load(a, A64_V30, pa, w);
     int pb = load_ptrv(c, s->b, -1);
-    ldr_q(a, A64_V31, pb, 0);
+    vec_load(a, A64_V31, pb, w);
 
     int sz = esz == 1 ? 0 : esz == 2 ? 1 : esz == 4 ? 2 : 3;
     uint32_t base = 0;
     int lane = 0;
     if (s->is_float) {
+        /* No packed float form exists below 128 bits -- the narrowest is a
+         * single D -- so two or more float lanes go element by element. */
         if (esz != 4 && esz != 8) {
             c64_die(c, s, "vector float element");
             return;
         }
+        if (w < 16) lane = 1;
         uint32_t bit = (esz == 8) ? (1u << 22) : 0;
         switch (s->op) {
         case IR_VADD: base = 0x4E20D400u | bit; break;
@@ -4040,9 +4059,10 @@ static void emit_vec(C64 *c, const IRInst *s) {
         case IR_VBOR:  base = 0x4EA01C00u; break;
         case IR_VBXOR: base = 0x6E201C00u; break;
         case IR_VMUL:
-            /* NEON has no 8-bit or 64-bit integer MUL.  Those lanes go
-             * through scalar MUL; the low esz bits match either signedness. */
-            if (esz != 2 && esz != 4) {
+            /* AArch64 has MUL down to 8-bit lanes (mul v0.8b = 0x0E229C20)
+             * but none at 64 bits, which falls back to scalar MUL; the low
+             * esz bits match either signedness. */
+            if (esz == 8) {
                 lane = 1;
                 break;
             }
@@ -4053,8 +4073,13 @@ static void emit_vec(C64 *c, const IRInst *s) {
             return;
         }
     }
+    /* Q is bit 30 (0x40000000); the 64- and 32-bit forms of these opcodes
+     * are the 128-bit word with that bit clear -- verified against clang:
+     * and.16b 0x4E221C20 / and.8b 0x0E221C20, eor.16b 0x6E221C20 /
+     * eor.8b 0x2E221C20. */
+    if (w != 16) base &= ~0x40000000u;
     if (lane) {
-        int n = 16 / esz;
+        int n = w / esz;
         for (int i = 0; i < n; i++) {
             umov_elem(a, SCR0, A64_V30, esz, i);
             umov_elem(a, SCR1, A64_V31, esz, i);
@@ -4066,7 +4091,7 @@ static void emit_vec(C64 *c, const IRInst *s) {
                       | (uint32_t)A64_V30);
     }
     int pd = load_ptrv(c, s->dst, -1);
-    str_q(a, A64_V30, pd, 0);
+    vec_store(a, A64_V30, pd, w);
 }
 
 /* Debug aid: FAKECC_DUMP_IR=1 prints one line per IR instruction, prefixed
