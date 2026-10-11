@@ -4441,14 +4441,16 @@ static void emit_function(C64 *c, int fi) {
             str_q(a, A64_V0 + i, SCR1, 0);
         }
         /* Stack arguments live in the caller's frame just above our saved
-         * one, so the block's front is filled from there.  This runs after
-         * the register slots because x0 doubles as the copy's chunk
-         * register -- its incoming value is already saved by then. */
+         * one, so the block's front is filled from there.  The chunk
+         * register has to be one of the two scratches: x0-x7 still hold the
+         * incoming arguments, and the parameter homing below reads them.
+         * Borrowing x0 here made `bar(5)` apply foo(garbage).  Recomputing
+         * the source per chunk keeps it to two registers. */
         emit_fp_addr(c, SCR0, c->apply_args_off + 0);
-        emit_fp_addr(c, SCR1, save_total);
         for (int k = 0; k < APPLY_STACK_MAX; k += 8) {
-            a64_ldr64(a, A64_X0, SCR1, k);
-            a64_str64(a, A64_X0, SCR0, k);
+            emit_fp_addr(c, SCR1, save_total + k);
+            a64_ldr64(a, SCR1, SCR1, 0);
+            a64_str64(a, SCR1, SCR0, k);
         }
     }
 
