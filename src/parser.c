@@ -2938,14 +2938,16 @@ static int char_literal_value(const char *text) {
     if (text[1] == '\\') {
         /* Hex escape `\xHH...`: parse all consecutive hex digits. */
         if (text[2] == 'x' || text[2] == 'X') {
-            int val = 0;
+            /* unsigned: an arbitrarily long \x run must not overflow in the
+             * compiler's own signed type. */
+            unsigned val = 0;
             int i = 3;
             while (text[i] != '\0' && isxdigit((unsigned char)text[i])) {
                 char c = text[i];
                 int d = (c >= '0' && c <= '9') ? c - '0'
                       : (c >= 'a' && c <= 'f') ? c - 'a' + 10
                       : c - 'A' + 10;
-                val = val * 16 + d;
+                val = val * 16u + (unsigned)d;
                 i++;
             }
             /* lexer guarantees at least one hex digit follows `\x` */
@@ -3073,16 +3075,16 @@ static Expr *parse_primary(Parser *p) {
                 if (src[i] == '\\' && i + 1 < slen) {
                     i++;
                     if (src[i] == 'x' || src[i] == 'X') {
-                        int val = 0;
+                        unsigned val = 0;
                         while (i + 1 < slen && isxdigit((unsigned char)src[i + 1])) {
                             i++;
                             char h = src[i];
                             int d = (h >= '0' && h <= '9') ? h - '0'
                                   : (h >= 'a' && h <= 'f') ? h - 'a' + 10
                                   : h - 'A' + 10;
-                            val = val * 16 + d;
+                            val = val * 16u + (unsigned)d;
                         }
-                        ch = val;
+                        ch = (int)val;
                         i++;
                     } else if (src[i] >= '0' && src[i] <= '7') {
                         int val = src[i] - '0';
@@ -3158,14 +3160,14 @@ static Expr *parse_primary(Parser *p) {
                 if (c == '\\' && i + 1 < slen) {
                     i++;
                     if (src[i] == 'x' || src[i] == 'X') {
-                        int val = 0;
+                        unsigned val = 0;
                         while (i + 1 < slen && isxdigit((unsigned char)src[i + 1])) {
                             i++;
                             char h = src[i];
                             int d = (h >= '0' && h <= '9') ? h - '0'
                                   : (h >= 'a' && h <= 'f') ? h - 'a' + 10
                                   : h - 'A' + 10;
-                            val = val * 16 + d;
+                            val = val * 16u + (unsigned)d;
                         }
                         seg[slen2++] = (char)(val & 0xff);
                     } else if (src[i] >= '0' && src[i] <= '7') {

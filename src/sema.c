@@ -1584,10 +1584,38 @@ static Type check_expr_inner(Expr *e) {
             set_type(e, t0);
             return type_clone(e->type);
         }
+        /* The float classification builtins are expanded inline too (ir.c reads
+         * their arguments positionally), so check the count here rather than
+         * let the lowering index past the end of the argument array.  The
+         * names are matched exactly, the way ir.c dispatches on them: a
+         * program that defines its own isunordered() keeps working. */
+        if (e->u.call.callee->kind == EX_VAR) {
+            static const char *const one_arg[] = {
+                "__builtin_isnan", "__builtin_isnanf", "__builtin_isnanl", "isnan",
+                "__builtin_isinf", "__builtin_isinff", "__builtin_isinfl", "isinf",
+                "__builtin_isfinite", "__builtin_isfinitef", "__builtin_isfinitel",
+                "isfinite", NULL };
+            static const char *const two_arg[] = {
+                "__builtin_isgreater", "__builtin_isgreaterequal",
+                "__builtin_isless", "__builtin_islessequal",
+                "__builtin_islessgreater", "__builtin_isunordered", NULL };
+            const char *bn = e->u.call.callee->u.var.name;
+            for (int k = 0; one_arg[k]; k++)
+                if (strcmp(bn, one_arg[k]) == 0 && e->u.call.args.len != 1) {
+                    die_at(e->loc.file, e->loc.line, e->loc.col,
+                           "'%s' takes exactly 1 argument", bn);
+                    return type_make_void();
+                }
+            for (int k = 0; two_arg[k]; k++)
+                if (strcmp(bn, two_arg[k]) == 0 && e->u.call.args.len != 2) {
+                    die_at(e->loc.file, e->loc.line, e->loc.col,
+                           "'%s' takes exactly 2 arguments", bn);
+                    return type_make_void();
+                }
+        }
         /* GCC integer bit builtins — codegen expands these inline (lzcnt /
          * tzcnt / popcnt / bswap) and reads their single argument directly, so
-         * the argument count has to be right before we get there. */
-        if (e->u.call.callee->kind == EX_VAR) {
+         * the argument count has to be right before we get there. */        if (e->u.call.callee->kind == EX_VAR) {
             const char *bn = e->u.call.callee->u.var.name;
             if (strncmp(bn, "__builtin_", 10) == 0 && e->u.call.args.len != 1
                 && (strstr(bn, "clz") || strstr(bn, "ctz") || strstr(bn, "ffs")
