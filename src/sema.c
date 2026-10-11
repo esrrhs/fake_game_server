@@ -84,6 +84,37 @@ static int stdc_builtin_info(const char *name, int *same_ty, int *nargs) {
     return 0;
 }
 
+/* How many parameters the formatted-I/O family takes *before* its `...`, or 0
+ * when `n` is not one of them (suffixes `_unlocked` / `_chk` are stripped).
+ *
+ * A `__builtin_printf` with no visible prototype used to be synthesised as a
+ * zero-prototype variadic, and on arm64 Darwin that pushes *every* argument --
+ * the format string and the destination included -- onto the anonymous vararg
+ * stack slots, while the callee reads its named parameters from x0/x1.  The
+ * call landed somewhere valid and then jumped through a wild pointer, so the
+ * simplest case in the suite,
+ *
+ *     __builtin_printf("hello\n");
+ *
+ * died with SIGSEGV.  Naming the leading parameters fixes both the arity and
+ * the register assignment.  The v* forms need four named parameters and
+ * params[] holds three, so they are left to the generic path. */
+static int stdio_named_arity(const char *n) {
+    if (strncmp(n, "__builtin_", 10) == 0) n += 10;
+    size_t len = strlen(n);
+    if (len > 9 && strcmp(n + len - 9, "_unlocked") == 0) len -= 9;
+    else if (len > 5 && strcmp(n + len - 5, "_chk") == 0) len -= 5;
+    char base[40];
+    if (len >= sizeof base) return 0;
+    memcpy(base, n, len);
+    base[len] = 0;
+    if (strcmp(base, "printf") == 0 || strcmp(base, "scanf") == 0) return 1;
+    if (strcmp(base, "fprintf") == 0 || strcmp(base, "sprintf") == 0
+        || strcmp(base, "fscanf") == 0 || strcmp(base, "sscanf") == 0) return 2;
+    if (strcmp(base, "snprintf") == 0) return 3;
+    return 0;
+}
+
 static int math_builtin_width(const char *n, int *nargs) {
     const char *b = n;
     if (strncmp(b, "__builtin_", 10) == 0) b += 10;
@@ -1456,6 +1487,7 @@ static Type check_expr_inner(Expr *e) {
             Type p0, p1, p2;
             Type *params[3];
             int num_params = 0;
+            int nstdio = 0;
             if (strcmp(bname, "__builtin_copysignf") == 0 || strcmp(bname, "copysignf") == 0) {
                 p0 = type_make_float(4);
                 p1 = type_make_float(4);
@@ -1494,10 +1526,28 @@ static Type check_expr_inner(Expr *e) {
                 params[0] = &p0; params[1] = &p1;
                 num_params = 2;
             } else if (strcmp(bname, "__builtin_powil") == 0 || strcmp(bname, "powil") == 0) {
-                p0 = type_make_float(type_long_double_width());
+                p0 = type_make_long_double();
                 p1 = type_make_int(4, 0);
                 params[0] = &p0; params[1] = &p1;
                 num_params = 2;
+            } else if ((nstdio = stdio_named_arity(bname)) > 0) {
+                /* Destination/stream and format are named parameters; the
+                 * conversion specifiers are the anonymous ones.  void* for
+                 * both leading pointers accepts char*, FILE* and a user's
+                 * own stream declaration alike. */
+                p0 = type_make_ptr(type_make_void());
+                params[0] = &p0;
+                num_params = 1;
+                if (nstdio >= 2) {
+                    p1 = type_make_ptr(type_make_void());
+                    params[1] = &p1;
+                    num_params = 2;
+                }
+                if (nstdio >= 3) {
+                    p2 = type_make_int(8, 1);   /* snprintf's size_t bound */
+                    params[2] = &p2;
+                    num_params = 3;
+                }
             } else {
                 int narg = 0;
                 int w = math_builtin_width(bname, &narg);
@@ -1521,7 +1571,7 @@ static Type check_expr_inner(Expr *e) {
             /* Builtins without a recorded prototype (memcpy, snprintf_chk, …)
              * used to look like `T (*)()`.  Mark them variadic so the strict
              * function-pointer arity check does not reject real builtin calls. */
-            if (num_params == 0)
+            if (num_params == 0 || nstdio > 0)
                 fn.func_is_variadic = 1;
             Type fp = type_make_ptr(fn);
             type_free(&fn);
