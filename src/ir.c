@@ -1862,6 +1862,18 @@ static void abi_adjust_cls(Type t, SysVRegClass *cls, int *nreg, int cls_cap,
      * so `struct { V }` has to be two of them.  Leaving it at one passed
      * only x0, and the upper half came back zero --
      * `struct S { V x; }; id(s).x[1]` read 0 instead of 4. */
+    /* SysV folds a wide SSE aggregate -- one YMM or ZMM -- into a single
+     * eightbyte (SSE + SSEUP*n).  arm64 has neither, so an aggregate past 16
+     * bytes is MEMORY.  Left as one INTEGER eightbyte it silently kept only
+     * the first eight bytes: `struct Box { V x; }` with a 32-byte V came back
+     * from a call with three quarters of the object missing.  A bare vector
+     * wider than 16 is handled just above; this is the same rule applied to a
+     * vector wrapped in a struct, which is not itself is_vector.
+     * abi_indirect_agg() already says these travel by pointer. */
+    if (t.kind == TY_STRUCT && *nreg == 1 && type_size(t) > 16) {
+        *nreg = 0;
+        return;
+    }
     if (t.kind == TY_STRUCT && type_size(t) == 16 && *nreg == 1) {
         cls[0] = SYSV_CLS_INTEGER;
         cls[1] = SYSV_CLS_INTEGER;
