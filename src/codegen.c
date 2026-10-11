@@ -5380,11 +5380,13 @@ void codegen(const IRModule *ir, EmitModule *out, int want_debug) {
                     /* int→long double.  Load int into a GP reg, store into dst's
                      * slot, fild from the slot (pushes ld to st0), fstpt the
                      * result back into dst's slot.  Clobbers RAX/RCX/RDX. */
-                    int pdr = (ra && inst->a >= 0 && inst->a < ra->num_values)
-                              ? ra->reg[inst->a] : -1;
-                    int src = (pdr >= 0) ? pdr : REG_RAX;
-                    if (pdr < 0) emit_load_spill(&out->text, REG_RAX, spill_offset(ra->spill_slot[inst->a]));
-                    emit_ld_from_gp_int(&out->text, src, inst->dst, ld_off,
+                    /* ensure_reg handles register / spill / out-of-range
+                     * operands; indexing ra->spill_slot[inst->a] here read
+                     * past the map when the operand has no slot. */
+                    if (ra && (inst->a < 0 || inst->a >= ra->num_values))
+                        fprintf(stderr, "PROBE: SITOFP a=%d num_values=%d ra=%p\n", inst->a, ra->num_values, (void*)ra);
+                    ensure_reg(&out->text, inst->a, REG_RAX, ra);
+                    emit_ld_from_gp_int(&out->text, REG_RAX, inst->dst, ld_off,
                                         src_w, src_u);
                     break;
                 }
