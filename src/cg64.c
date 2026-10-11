@@ -3762,11 +3762,16 @@ static void emit_call(C64 *c, const IRInst *s) {
     }
 
     if (s->align16 == A64_MARK_HFA) {
-        int r0 = SCR0, r1 = SCR1;
-        a64_fmov_gp(a, r0, A64_V0, 0, 1);
-        if (s->b >= 0)
-            a64_fmov_gp(a, r1, A64_V1, 0, 1);
-        place_pair(c, s->dst, s->b, r0, r1);
+        /* A wide HFA result is bits in v0-v3.  Each eightbyte is placed on
+         * its own rather than as a pair: the destination homes are GP
+         * registers and the sources are V, so they cannot collide and one
+         * scratch is enough for all four. */
+        const IRValue hv[4] = { s->dst, s->b, s->c, s->d };
+        for (int i = 0; i < 4; i++) {
+            if (hv[i] < 0) continue;
+            a64_fmov_gp(a, SCR0, A64_V0 + i, 0, 1);
+            place_from(c, hv[i], SCR0);
+        }
     } else if (s->dst >= 0 && vec16_val(c, s->dst)) {
         int h = fp_home(c, s->dst);
         if (h < 0) commit_q(c, s->dst, A64_V0);
@@ -5072,9 +5077,15 @@ static void emit_function(C64 *c, int fi) {
             if (s->align16 == A64_MARK_HFA && s->a >= 0) {
                 int r0 = load_op(c, s->a, -1);
                 int r1 = s->b >= 0 ? load_op(c, s->b, r0) : -1;
+                int r2 = s->c >= 0 ? load_op(c, s->c, r1) : -1;
+                int r3 = s->d >= 0 ? load_op(c, s->d, r2) : -1;
                 a64_fmov_gp(a, A64_V0, r0, 1, vw(c, s->a) == 8);
                 if (r1 >= 0)
                     a64_fmov_gp(a, A64_V1, r1, 1, vw(c, s->b) == 8);
+                if (r2 >= 0)
+                    a64_fmov_gp(a, A64_V2, r2, 1, vw(c, s->c) == 8);
+                if (r3 >= 0)
+                    a64_fmov_gp(a, A64_V3, r3, 1, vw(c, s->d) == 8);
             } else if (s->a >= 0 && s->b >= 0) {
                 int r0 = load_op(c, s->a, -1);
                 int r1 = load_op(c, s->b, r0);
