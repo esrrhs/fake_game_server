@@ -1584,6 +1584,20 @@ static Type check_expr_inner(Expr *e) {
             set_type(e, t0);
             return type_clone(e->type);
         }
+        /* GCC integer bit builtins — codegen expands these inline (lzcnt /
+         * tzcnt / popcnt / bswap) and reads their single argument directly, so
+         * the argument count has to be right before we get there. */
+        if (e->u.call.callee->kind == EX_VAR) {
+            const char *bn = e->u.call.callee->u.var.name;
+            if (strncmp(bn, "__builtin_", 10) == 0 && e->u.call.args.len != 1
+                && (strstr(bn, "clz") || strstr(bn, "ctz") || strstr(bn, "ffs")
+                    || strstr(bn, "popcount") || strstr(bn, "parity")
+                    || strstr(bn, "clrsb") || strstr(bn, "bswap"))) {
+                die_at(e->loc.file, e->loc.line, e->loc.col,
+                       "'%s' takes exactly 1 argument", bn);
+                return type_make_void();
+            }
+        }
         /* __builtin_ctzll(x) — count trailing zeros of a nonzero uint64.  The
          * surrounding code guarantees the argument is nonzero (`_w &&`), so
          * the result is well-defined (1..64).  Returns int. */

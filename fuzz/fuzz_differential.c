@@ -29,11 +29,11 @@ static void tmp_path(char *buf, size_t n, const char *suffix) {
 }
 
 /* gcc cannot parse fakecc's own dialect (package/import/runtime.*), so such a
- * program can never agree with gcc. */
+ * program can never agree with gcc.  The package declaration need not be the
+ * very first token — a leading comment is enough to hide it from a
+ * prefix check — so look for the keywords anywhere. */
 static int is_fakecc_dialect(const char *s) {
-    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-    return strncmp(s, "package", 7) == 0 || strncmp(s, "import", 6) == 0 ||
-           strstr(s, "runtime.") != NULL;
+    return strstr(s, "package") || strstr(s, "import") || strstr(s, "runtime.");
 }
 
 /* gcc is only a meaningful oracle for text */

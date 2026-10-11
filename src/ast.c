@@ -2060,7 +2060,7 @@ int fold_const_int(const Expr *e, long long *out) {
         long long v;
         if (!fold_const_int(e->u.un.operand, &v)) return 0;
         switch (e->u.un.op) {
-        case UOP_NEG: *out = -v; return 1;
+        case UOP_NEG: *out = (long long)(0ull - (unsigned long long)v); return 1;
         case UOP_POS: *out = v; return 1;
         case UOP_BITNOT: *out = ~v; return 1;
         case UOP_NOT: *out = !v ? 1 : 0; return 1;
@@ -2101,27 +2101,30 @@ int fold_const_int(const Expr *e, long long *out) {
         int trunc_result = 1;
         switch (e->u.bin.op) {
         case BOP_ADD:
-            res = is_u ? (long long)(ul + ur) : l + r;
+            /* Unsigned arithmetic: the fold must not overflow in the
+             * compiler's own signed type (-fwrapv semantics, which is what the
+             * oracle runs with anyway). */
+            res = (long long)((unsigned long long)l + (unsigned long long)r);
             /* Signed ADD/SUB/MUL of constants keep the full 64-bit value so
              * parse-time folds (when e->type is still default int) do not
              * truncate `1L << 62` to 32 bits before a later subtract. */
             if (!is_u) trunc_result = 0;
             break;
         case BOP_SUB:
-            res = is_u ? (long long)(ul - ur) : l - r;
+            res = (long long)((unsigned long long)l - (unsigned long long)r);
             if (!is_u) trunc_result = 0;
             break;
         case BOP_MUL:
-            res = is_u ? (long long)(ul * ur) : l * r;
+            res = (long long)((unsigned long long)l * (unsigned long long)r);
             if (!is_u) trunc_result = 0;
             break;
         case BOP_DIV:
             if (r == 0) { *out = 0; return 1; }
-            res = is_u ? (ur ? (long long)(ul / ur) : 0) : l / r;
+            res = (long long)((unsigned long long)l / (unsigned long long)r);
             break;
         case BOP_MOD:
             if (r == 0) { *out = 0; return 1; }
-            res = is_u ? (ur ? (long long)(ul % ur) : 0) : l % r;
+            res = (long long)((unsigned long long)l % (unsigned long long)r);
             break;
         case BOP_BITAND: res = (long long)(ul & ur); break;
         case BOP_BITOR:  res = (long long)(ul | ur); break;

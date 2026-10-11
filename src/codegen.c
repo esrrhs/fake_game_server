@@ -4511,7 +4511,11 @@ void codegen(const IRModule *ir, EmitModule *out, int want_debug) {
                     && (strstr(inst->call_name, "clz") || strstr(inst->call_name, "ctz")
                         || strstr(inst->call_name, "ffs") || strstr(inst->call_name, "popcount")
                         || strstr(inst->call_name, "parity") || strstr(inst->call_name, "clrsb")
-                        || strstr(inst->call_name, "bswap"))) {
+                        || strstr(inst->call_name, "bswap"))
+                    /* These all read call_args[0]; `__builtin_clz()` with no
+                     * argument would be a NULL dereference.  Such a call falls
+                     * through to the generic path and fails at link time. */
+                    && inst->call_args && inst->call_nargs > 0) {
                     const char *bn = inst->call_name;
                     int w64 = 1;
                     if (strstr(bn, "bswap16")) w64 = 0;
