@@ -21,6 +21,33 @@
 #define SCR0 A64_X16
 #define SCR1 A64_X17
 
+/* GNU __builtin_apply_args / __builtin_apply block, AAPCS64 register file.
+ * Only self-consistency is required -- both ends are fakecc -- but the shape
+ * mirrors gcc's arm64 apply_args_size(): the outgoing stack arguments sit at
+ * the front, then the integer registers, then the SIMD ones.
+ *
+ *   [0,  64)  outgoing stack arguments, copied to the callee frame on apply
+ *   [64, 128)  x0..x7
+ *   [128,256)  v0..v7, 16 bytes each
+ *
+ * The result block repeats the layout and adds a scratch tail for the three
+ * operands of __builtin_apply (which may themselves live in x0-x7) plus the
+ * saved sp.  APPLY_STACK_MAX bounds the `size` an apply can carry on the
+ * stack; the copy below is unrolled to exactly that many bytes. */
+#define APPLY_STACK_MAX   64
+#define APPLY_GP_OFF      64
+#define APPLY_V_OFF       128
+#define APPLY_BLOCK_SIZE  256
+/* APPLY_SCRATCH_OFF is the byte offset of that tail *inside* the block.
+ * APPLY_RES_SCRATCH is the block's total size; using it as the scratch
+ * offset lands one past the end of the block, which is exactly where the
+ * apply_args block sits in the frame -- the stashed function pointer was
+ * written over the outgoing stack arguments and then read back as the call
+ * target. */
+#define APPLY_SCRATCH_OFF  APPLY_BLOCK_SIZE
+#define APPLY_RES_SCRATCH (APPLY_BLOCK_SIZE + 32)
+
+
 typedef struct {
     A64Asm           *as;
     const IRModule   *ir;
@@ -37,6 +64,11 @@ typedef struct {
     int               call_area;
     int               save_total;  /* fp/lr + callee-saved saves bytes  */
     int               vararg_off;  /* fp offset of the first anonymous arg */
+    /* GNU __builtin_apply_args / __builtin_apply blocks, fp-relative; 0 when
+     * this function does not use them. */
+    int               apply_args_off;
+    int               apply_result_off;
+    int               epilog_label; /* function's epilogue, for __builtin_return */
     /* Module globals: section (G_RO/G_DATA/G_BSS) and in-section offset. */
     int              *gsect;
     size_t           *goff;
@@ -2952,6 +2984,96 @@ static void emit_fpclassify_builtin(C64 *c, const IRInst *s) {
     commit(c, s->dst, dst);
 }
 
+/* GNU __builtin_apply(fn, args, size): call `fn` with the argument block
+ * `args` captured by __builtin_apply_args, leaving the result registers in a
+ * block whose address this expression produces.  __builtin_return then
+ * returns those from the enclosing function.
+ *
+ * This is not a non-local jump.  Like x86's emit_builtin_apply it is an
+ * ordinary indirect call with sp moved down for the outgoing stack
+ * arguments; sp is put back before returning, so the call site sees a plain
+ * call whose result is a pointer. */
+static void emit_builtin_apply(C64 *c, const IRInst *s) {
+    A64Asm *a = c->as;
+    int res = c->apply_result_off;
+    if (s->call_nargs < 3 || res == 0) return;
+
+    /* f, args and size may themselves live in x0-x7, which the register
+     * reload below overwrites -- stash all three first. */
+    int f = load_op(c, s->call_args[0], -1);
+    emit_fp_addr(c, SCR1, res + APPLY_SCRATCH_OFF + 0);
+    a64_str64(a, f, SCR1, 0);
+    int blk = load_op(c, s->call_args[1], f);
+    emit_fp_addr(c, SCR1, res + APPLY_SCRATCH_OFF + 8);
+    a64_str64(a, blk, SCR1, 0);
+    (void)load_op(c, s->call_args[2], blk);
+
+    /* sp, so it can be restored once the call is done. */
+    mov_sp_like(a, SCR0, A64_SP);
+    emit_fp_addr(c, SCR1, res + APPLY_SCRATCH_OFF + 16);
+    a64_str64(a, SCR0, SCR1, 0);
+
+    /* Outgoing stack arguments.  `size` is a runtime value and arm64 has no
+     * rep movsb, so this always moves APPLY_STACK_MAX bytes rather than
+     * exactly `size`; the callee reads only what its signature declares. */
+    a64_sub_imm12(a, A64_SP, A64_SP, APPLY_STACK_MAX, 0, 1, 0);
+    emit_fp_addr(c, SCR0, res + APPLY_SCRATCH_OFF + 8);
+    a64_ldr64(a, SCR0, SCR0, 0);          /* SCR0 = argument block */
+    mov_sp_like(a, SCR1, A64_SP);
+    for (int k = 0; k < APPLY_STACK_MAX; k += 8) {
+        a64_ldr64(a, A64_X0, SCR0, k);
+        a64_str64(a, A64_X0, SCR1, k);
+    }
+
+    /* Reload the argument registers from the block.  SCR0/SCR1 are outside
+     * x0-x7 and v0-v7, so nothing here disturbs the pointer being walked. */
+    for (int i = 0; i < 8; i++) {
+        a64_add_imm12(a, SCR1, SCR0, (unsigned)(APPLY_GP_OFF + i * 8), 0, 1, 0);
+        a64_ldr64(a, A64_X0 + i, SCR1, 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        a64_add_imm12(a, SCR1, SCR0, (unsigned)(APPLY_V_OFF + i * 16), 0, 1, 0);
+        ldr_q(a, A64_V0 + i, SCR1, 0);
+    }
+
+    emit_fp_addr(c, SCR0, res + APPLY_SCRATCH_OFF + 0);
+    a64_ldr64(a, SCR0, SCR0, 0);
+    a64_blr(a, SCR0);
+
+    /* Park the result registers, then put sp back. */
+    for (int i = 0; i < 8; i++) {
+        emit_fp_addr(c, SCR1, res + i * 8);
+        a64_str64(a, A64_X0 + i, SCR1, 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        emit_fp_addr(c, SCR1, res + APPLY_V_OFF + i * 16);
+        str_q(a, A64_V0 + i, SCR1, 0);
+    }
+    emit_fp_addr(c, SCR1, res + APPLY_SCRATCH_OFF + 16);
+    a64_ldr64(a, SCR1, SCR1, 0);
+    mov_sp_like(a, A64_SP, SCR1);
+
+    int d = dst_reg(c, s->dst);
+    emit_fp_addr(c, d, res);
+    commit(c, s->dst, d);
+}
+
+/* GNU __builtin_return(block): return from the enclosing function with the
+ * value the applied function left in `block`. */
+static void emit_builtin_return(C64 *c, const IRInst *s) {
+    A64Asm *a = c->as;
+    if (s->call_nargs < 1 || c->epilog_label < 0) return;
+    int p = load_op(c, s->call_args[0], -1);
+    /* An integer result came back in x0/x1, a float one in v0/v1.  Both are
+     * restored; whichever this function was declared to return is the one its
+     * own caller reads. */
+    a64_ldr64(a, A64_X0, p, 0);
+    a64_ldr64(a, A64_X1, p, 8);
+    ldr_q(a, A64_V0, p, APPLY_V_OFF);
+    ldr_q(a, A64_V1, p, APPLY_V_OFF + 16);
+    a64_b(a, c->epilog_label);
+}
+
 static void emit_call(C64 *c, const IRInst *s) {
     A64Asm *a = c->as;
     int n = s->call_nargs;
@@ -2962,6 +3084,21 @@ static void emit_call(C64 *c, const IRInst *s) {
      * that the syscall lowering needs to re-read. */
     if (s->call_name && strcmp(s->call_name, "__syscall") == 0) {
         emit_syscall(c, s);
+        return;
+    }
+    if (s->call_name && strcmp(s->call_name, "__builtin_apply_args") == 0) {
+        /* The block was filled by the prologue; hand back its address. */
+        int d = dst_reg(c, s->dst);
+        emit_fp_addr(c, d, c->apply_args_off);
+        commit(c, s->dst, d);
+        return;
+    }
+    if (s->call_name && strcmp(s->call_name, "__builtin_apply") == 0) {
+        emit_builtin_apply(c, s);
+        return;
+    }
+    if (s->call_name && strcmp(s->call_name, "__builtin_return") == 0) {
+        emit_builtin_return(c, s);
         return;
     }
     if (s->call_name && strcmp(s->call_name, "__fakecc_swp") == 0) {
@@ -4215,7 +4352,22 @@ static void emit_function(C64 *c, int fi) {
     if (call_area % 16) call_area += 16 - (call_area % 16);
     c->call_area = call_area;
 
-    int locals = pinned + spill_area + fp_bytes + call_area;
+    /* __builtin_apply_args / __builtin_apply blocks live below everything
+     * else in the frame; their fp-relative offsets are what the builtins
+     * address them by. */
+    c->apply_args_off = 0;
+    c->apply_result_off = 0;
+    int off_acc = pinned + spill_area + fp_bytes + call_area;
+    if (fn->needs_apply_args) {
+        off_acc += APPLY_BLOCK_SIZE;
+        c->apply_args_off = -off_acc;
+    }
+    if (fn->needs_apply) {
+        off_acc += APPLY_RES_SCRATCH;
+        c->apply_result_off = -off_acc;
+    }
+
+    int locals = off_acc;
     if (locals % 16) locals += 16 - (locals % 16);
     c->frame_locals = locals;
 
@@ -4275,6 +4427,30 @@ static void emit_function(C64 *c, int fi) {
     }
     if (locals)
         sub_sp_bytes(a, (unsigned)locals);
+
+    /* __builtin_apply_args hands the caller the *incoming* registers, so
+     * they have to be captured here -- before the parameter homing below
+     * moves them into their homes. */
+    if (fn->needs_apply_args) {
+        for (int i = 0; i < 8; i++) {
+            emit_fp_addr(c, SCR1, c->apply_args_off + APPLY_GP_OFF + i * 8);
+            a64_str64(a, A64_X0 + i, SCR1, 0);
+        }
+        for (int i = 0; i < 8; i++) {
+            emit_fp_addr(c, SCR1, c->apply_args_off + APPLY_V_OFF + i * 16);
+            str_q(a, A64_V0 + i, SCR1, 0);
+        }
+        /* Stack arguments live in the caller's frame just above our saved
+         * one, so the block's front is filled from there.  This runs after
+         * the register slots because x0 doubles as the copy's chunk
+         * register -- its incoming value is already saved by then. */
+        emit_fp_addr(c, SCR0, c->apply_args_off + 0);
+        emit_fp_addr(c, SCR1, save_total);
+        for (int k = 0; k < APPLY_STACK_MAX; k += 8) {
+            a64_ldr64(a, A64_X0, SCR1, k);
+            a64_str64(a, A64_X0, SCR0, k);
+        }
+    }
 
     /* ---- Incoming integer parameters (x0..x7, then caller stack) ---- */
     int nparams = 0;
@@ -4584,6 +4760,7 @@ static void emit_function(C64 *c, int fi) {
 
     /* ---- Body ---- */
     int epilog = a64_new_label(a);
+    c->epilog_label = epilog;
     for (size_t j = nparams; j < fn->insts.len; j++) {
         const IRInst *s = &fn->insts.data[j];
         if (c64_ir_dump_on())
