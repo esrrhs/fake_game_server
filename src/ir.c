@@ -8006,8 +8006,10 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
         const char *lbl_name = e->u.label_addr.label;
         int lbl_id = g_ir_label_map ? labelmap_find(g_ir_label_map, lbl_name) : -1;
         if (lbl_id < 0) {
-            fprintf(stderr, "fakecc: &&%s: undeclared label\n", lbl_name);
-            exit(1);
+            /* A library call must not take the process down with it. */
+            die_at(e->loc.file, e->loc.line, e->loc.col,
+                   "use of undeclared label '%s'", lbl_name);
+            return -1;
         }
         IRValue dst = new_value(fn);
         emit_inst(fn, IR_LADDR, dst, -1, -1, lbl_id, e->loc);
