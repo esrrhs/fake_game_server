@@ -151,6 +151,10 @@ int abi_indirect_agg(Type t);
 /* 1 when `t` is an AAPCS64 homogeneous float/double aggregate of 1–4
  * elements.  Always 0 on SysV x86. */
 int abi_is_hfa(Type t);
+/* Element count of that aggregate (1-4), or -1 when `t` is not one.
+ * An HFA of three or four elements is 24 / 32 bytes, which AAPCS64 still
+ * passes one V register per element. */
+int abi_hfa_elem_count(Type t);
 /* Width of one element of that aggregate (4 or 8), or -1.  Not the size of
  * `t`: an aligned(16) `struct { double d; }` is 16 bytes with one 8-byte
  * element.  -1 on SysV x86. */

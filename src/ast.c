@@ -852,11 +852,15 @@ static int hfa_elems(Type t, int *kind) {
     return any ? total : -1;
 }
 
-int abi_is_hfa(Type t) {
-    if (!abi_is_arm64()) return 0;
+int abi_hfa_elem_count(Type t) {
+    if (!abi_is_arm64()) return -1;
     int kind = 0;
     int n = hfa_elems(t, &kind);
-    return n >= 1 && n <= 4;
+    return (n >= 1 && n <= 4) ? n : -1;
+}
+
+int abi_is_hfa(Type t) {
+    return abi_hfa_elem_count(t) > 0;
 }
 
 /* Width of one element of a homogeneous float/double aggregate, or -1.

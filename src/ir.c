@@ -1826,12 +1826,26 @@ static IRValue va_float_bits(IRFunction *fn, IRValue v, SourceLoc loc) {
     return v;
 }
 
-static void abi_adjust_cls(Type t, SysVRegClass *cls, int *nreg, SourceLoc loc) {
+/* `cls_cap` is how many SysVRegClass slots the caller owns.  AAPCS64 gives
+ * an HFA one V register per element, so a three- or four-element HFA (24 /
+ * 32 bytes) is register-passed even though SysV classified it MEMORY.  Only
+ * the call and parameter paths have room for that today: a return would need
+ * IR_RETURN to carry more than the two values it holds, so the return callers
+ * pass a capacity of 2 and a wide HFA result is still rejected. */
+static void abi_adjust_cls(Type t, SysVRegClass *cls, int *nreg, int cls_cap,
+                           SourceLoc loc) {
     if (abi_sret_uses_gp()) return;
     if (abi_is_hfa(t)) {
-        if (*nreg == 0)
+        if (*nreg == 0) {
+            int nel = abi_hfa_elem_count(t);
+            if (nel > 2 && nel <= cls_cap) {
+                for (int i = 0; i < nel; i++) cls[i] = SYSV_CLS_SSE;
+                *nreg = nel;
+                return;
+            }
             die_at(loc.file ? loc.file : "<arm64>", loc.line, loc.col,
                    "arm64 HFA wider than two eightbytes is not supported yet");
+        }
         return;
     }
     /* vector_size(16) is one Q register on Darwin.  Wider vectors have no
@@ -7867,7 +7881,7 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
             ret_nreg_pre = 2;
         } else if (is_ret_struct_pre) {
             ret_nreg_pre = sysv_classify_agg(e->type, ret_cls_pre);
-            abi_adjust_cls(e->type, ret_cls_pre, &ret_nreg_pre, e->loc);
+            abi_adjust_cls(e->type, ret_cls_pre, &ret_nreg_pre, 2, e->loc);
         }
         int ret_in_mem_pre = is_ret_struct_pre && ret_nreg_pre == 0;
         if (type_is_complex_ldouble(e->type)) {
@@ -7906,7 +7920,7 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
             Expr *arg = e->u.call.args.data[i];
             IRValue av = lower_expr(fn, st, arg);
             if (arg->type.kind == TY_STRUCT || arg->type.is_vector || type_is_pair16(arg->type)) {
-                SysVRegClass cls[2];
+                SysVRegClass cls[4];
                 int nreg;
                 int asz = type_size(arg->type);
                 if (type_is_pair16(arg->type)) {
@@ -7916,7 +7930,7 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
                     asz = 16;
                 } else {
                     nreg = sysv_classify_agg(arg->type, cls);
-                    abi_adjust_cls(arg->type, cls, &nreg, e->loc);
+                    abi_adjust_cls(arg->type, cls, &nreg, 4, e->loc);
                 }
                 int is_memory = (nreg == 0);
                 /* SysV: unnamed __m256/__m512 to a variadic or unprototyped
@@ -11834,7 +11848,7 @@ int ir_generate(const TranslationUnit *tu, IRModule *ir, int pin_locals) {
         } else if (irfn.ret_is_struct) {
             SysVRegClass rcls[2];
             irfn.ret_reg_n = sysv_classify_agg(fd->ret_type, rcls);
-            abi_adjust_cls(fd->ret_type, rcls, &irfn.ret_reg_n, fd->loc);
+            abi_adjust_cls(fd->ret_type, rcls, &irfn.ret_reg_n, 2, fd->loc);
             for (int i = 0; i < irfn.ret_reg_n && i < 2; i++)
                 irfn.ret_reg_cls[i] = (int)rcls[i];
             /* Struct size for copy/load lives in ret_width. */
@@ -11893,7 +11907,7 @@ int ir_generate(const TranslationUnit *tu, IRModule *ir, int pin_locals) {
                 continue;
             }
             if (pty.kind == TY_STRUCT || pty.is_vector || type_is_pair16(pty)) {
-                SysVRegClass cls[2];
+                SysVRegClass cls[4];
                 int nreg;
                 if (type_is_pair16(pty)) {
                     cls[0] = SYSV_CLS_INTEGER;
@@ -11901,7 +11915,7 @@ int ir_generate(const TranslationUnit *tu, IRModule *ir, int pin_locals) {
                     nreg = 2;
                 } else {
                     nreg = sysv_classify_agg(pty, cls);
-                    abi_adjust_cls(pty, cls, &nreg, ploc);
+                    abi_adjust_cls(pty, cls, &nreg, 4, ploc);
                 }
                 int is_memory = (nreg == 0);
                 if (is_memory && (sysv_memory_pass_as_pointer(pty)
