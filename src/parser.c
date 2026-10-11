@@ -1303,9 +1303,16 @@ static Type parse_specifiers_full(Parser *p, int *storage_class) {
 
     if (!has_type) {
         if (is_complex) {
-            /* Bare _Complex defaults to _Complex double */
+            /* Bare _Complex defaults to _Complex double.  The type is built
+             * here, so finish_specifiers must be told the complex wrapping is
+             * already done: handing it is_complex again wraps a second time
+             * and yields a struct of two _Complex double, i.e. 32 bytes and a
+             * four-element HFA.  That is how bare _Complex ended up a
+             * different size from _Complex double (32 against 16) and why
+             * taking it by value died with "HFA wider than two eightbytes". */
             Type t = get_or_create_complex_type(p, type_make_float(8));
-            return finish_specifiers(t, is_const, is_volatile, is_restrict, is_complex, attr_vec, p);
+            return finish_specifiers(t, is_const, is_volatile, is_restrict, 0,
+                                     attr_vec, p);
         }
         const Token *t = peek(p);
         die_at(t->loc.file, t->loc.line, t->loc.col,
