@@ -2004,8 +2004,13 @@ int fold_const_int(const Expr *e, long long *out) {
     if (fakecc_had_error()) return FAKECC_ERR;
     if (!e) return 0;
     if (e->kind == EX_FLOAT_LIT && e->u.float_text) {
-        /* Integer conversion of a floating constant: truncate toward zero. */
-        *out = (long long)strtold(e->u.float_text, NULL);
+        /* Integer conversion of a floating constant: truncate toward zero.
+         * Out of long long range the conversion is undefined in C, so clamp
+         * instead of letting the compiler itself overflow. */
+        long double d = strtold(e->u.float_text, NULL);
+        if (d >= 9223372036854775808.0L) *out = 9223372036854775807LL;
+        else if (d < -9223372036854775807.0L - 1.0L) *out = (-9223372036854775807LL - 1);
+        else *out = (long long)d;
         return 1;
     }
     if (e->kind == EX_INT_LIT) {
@@ -2129,10 +2134,12 @@ int fold_const_int(const Expr *e, long long *out) {
         case BOP_BITAND: res = (long long)(ul & ur); break;
         case BOP_BITOR:  res = (long long)(ul | ur); break;
         case BOP_BITXOR: res = (long long)(ul ^ ur); break;
-        case BOP_SHL:    res = is_u ? (long long)(ul << (r & 63)) : (l << r); break;
+        case BOP_SHL:
+            res = (long long)((unsigned long long)l << (r & 63));
+            break;
         case BOP_SHR:
             if (is_u) res = (long long)(ul >> (r & 63));
-            else res = l >> r;
+            else res = l >> (r & 63);
             break;
         case BOP_EQ:     res = is_u ? (ul == ur) : (l == r); break;
         case BOP_NE:     res = is_u ? (ul != ur) : (l != r); break;

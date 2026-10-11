@@ -3460,6 +3460,15 @@ static Expr *parse_init_list(Parser *p) {
             elem = parse_assign(p);
         }
         if (end_idx >= idx) {
+            /* A designator range `[a ... b]` expands to b-a+1 elements, and
+             * `r` is an int: a bogus range asks for an allocation of
+             * astronomical size (and would wrap the loop).  Diagnose it. */
+            if (end_idx - idx > 0x100000) {
+                die_at(loc.file, loc.line, loc.col,
+                       "initializer range is too large");
+                expr_free(elem);
+                return NULL;
+            }
             for (int r = idx; r <= end_idx; r++) {
                 if (num >= cap) {
                     cap = cap ? cap * 2 : 8;
