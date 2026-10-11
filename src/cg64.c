@@ -2427,6 +2427,17 @@ static void emit_sat_builtin(C64 *c, const IRInst *s) {
     commit(c, s->dst, dst);
 }
 
+/* Byte count of a MEMORY-blob call argument, or 0 when this one is not a
+ * blob.  ir.c hands the backend a pointer to the object plus the flag and
+ * the size; anything missing falls back to 1 so the copy still happens. */
+static int call_arg_blob_bytes(const IRInst *inst, int k) {
+    if (!inst->call_arg_on_stack || !(inst->call_arg_on_stack[k] & CALL_ARG_BLOB))
+        return 0;
+    if (inst->call_arg_nbytes && inst->call_arg_nbytes[k] > 0)
+        return inst->call_arg_nbytes[k];
+    return 1;
+}
+
 static int outgoing_stack_bytes(C64 *c, const IRInst *s) {
     if (!s->call_nargs) return s->align16 == A64_MARK_SRET ? 16 : 0;
     if (s->call_name && strcmp(s->call_name, "__syscall") == 0) return 0;
@@ -2445,7 +2456,16 @@ static int outgoing_stack_bytes(C64 *c, const IRInst *s) {
             fp++;
             continue;
         }
-        if ((f & CALL_ARG_STACK) || (f & CALL_ARG_BLOB) || gp >= 8 || scalar || qv) {
+        if (f & CALL_ARG_BLOB) {
+            /* Must match the reservation in the call sequence exactly, or the
+             * outgoing area comes out smaller than the callee expects and the
+             * object lands somewhere the callee never looks. */
+            int nb = call_arg_blob_bytes(s, i);
+            int al = (f & CALL_ARG_ALIGN64) ? 64
+                   : (f & CALL_ARG_ALIGN32) ? 32 : 16;
+            if (nb > 8 && (st % al)) st = (st + al - 1) & ~(al - 1);
+            st += nb;
+        } else if ((f & CALL_ARG_STACK) || gp >= 8 || scalar || qv) {
             if (qv) {
                 if (st & 15) st = (st + 15) & ~15;
                 st += 16;
@@ -3285,8 +3305,22 @@ static void emit_call(C64 *c, const IRInst *s) {
         unsigned f = s->call_arg_on_stack ? s->call_arg_on_stack[i] : 0;
         int scalar = scalar_fp_val(c, s->call_args[i]);
         int qv = vec16_val(c, s->call_args[i]);
-        if (f & CALL_ARG_BLOB)
-            c64_die(c, s, "aggregate stack blob");
+        if (f & CALL_ARG_BLOB) {
+            /* MEMORY aggregate: the object is copied into the outgoing area
+             * (see the blob loop after the GP shuffle).  Reserve its bytes
+             * here, honouring the alignment ir.c asked for. */
+            int nb = call_arg_blob_bytes(s, i);
+            int al = (f & CALL_ARG_ALIGN64) ? 64
+                   : (f & CALL_ARG_ALIGN32) ? 32 : 16;
+            if (nb > 8 && (stk_bytes % al))
+                stk_bytes = (stk_bytes + al - 1) & ~(al - 1);
+            stk_at[stk_n] = i;
+            stk_off[stk_n] = stk_bytes;
+            stk_bytes += nb;
+            stk_n++;
+            st_used++;
+            continue;
+        }
         if ((scalar || qv) && !(f & CALL_ARG_STACK) && fp_used < 8) {
             fp_at[fp_n] = i;
             fp_vn[fp_n] = fp_used++;
@@ -3314,6 +3348,8 @@ static void emit_call(C64 *c, const IRInst *s) {
      * overwrite.  The area sits at [sp+0 ..).  A 16-byte vector occupies
      * one aligned Q slot once v0–v7 are full. */
     for (int i = 0; i < stk_n; i++) {
+        unsigned char af = s->call_arg_on_stack ? s->call_arg_on_stack[stk_at[i]] : 0;
+        if (af & CALL_ARG_BLOB) continue;   /* copied after the GP shuffle */
         IRValue av = s->call_args[stk_at[i]];
         int off = stk_off[i];
         if (vec16_val(c, av)) {
@@ -3328,6 +3364,36 @@ static void emit_call(C64 *c, const IRInst *s) {
             a64_str64(a, r, A64_SP, off);
         }
     }
+    /* MEMORY-blob arguments, copied here -- before the GP shuffle below.
+     * That shuffle is what consumes the incoming x0-x7, so a pointer living
+     * in one of them is gone by the time the copy runs, and the sources are
+     * exactly the values the shuffle wants to read.  Only x16/x17 are spare
+     * at this point, so the destination is addressed off sp and the source
+     * off the pointer instead of going through copy_bytes(), which wants a
+     * third register for the chunk.  LDUR/STUR are unscaled, so neither
+     * side has to be aligned. */
+    for (int i = 0; i < stk_n; i++) {
+        unsigned char af = s->call_arg_on_stack ? s->call_arg_on_stack[stk_at[i]] : 0;
+        if (!(af & CALL_ARG_BLOB)) continue;
+        int nb = call_arg_blob_bytes(s, stk_at[i]);
+        int base = stk_off[i];
+        /* Unsigned-offset forms: their Rn=31 means SP, while the unscaled
+         * LDUR/STUR used by the rest of the frame helpers reads 31 as XZR
+         * (`strb w0, [sp], #0` would assemble as `[xzr]` and fault). */
+        if (base + nb > 4095)
+            c64_die(c, s, "aggregate stack blob past the reachable outgoing area");
+        int src = load_op(c, s->call_args[stk_at[i]], SCR0);
+        int k = 0;
+        for (; k + 8 <= nb; k += 8) {
+            a64_ldr64(a, SCR0, src, k);
+            a64_str64(a, SCR0, A64_SP, base + k);
+        }
+        for (; k < nb; k++) {
+            a64_ldr8(a, SCR0, src, k);
+            a64_str8(a, SCR0, A64_SP, base + k);
+        }
+    }
+
     /* Scalar float/double arguments.  A home in v1 moving to v0 must
      * not run before the value that still lives in v0. */
     {
@@ -4154,7 +4220,10 @@ static void emit_function(C64 *c, int fi) {
     typedef struct { int src_reg; int src_mem;   /* -1, or fp offset */
                     int src_vec;                /* >=0: incoming V register */
                     int dst_reg; int dst_mem;   /* -1, or fp spill offset */
-                    int is64; int done; } PMove;
+                    int is64; int done;
+                    /* MEMORY blob: the incoming value is the *address* of
+                     * the argument, not its contents. */
+                    int is_blob; } PMove;
     PMove *mv = xmalloc((size_t)(nparams > 0 ? nparams : 1) * sizeof(PMove));
     typedef struct { int src; int dst; int spill; int isd; int stack; int done; } FIn;
     FIn fin[16];
@@ -4165,8 +4234,29 @@ static void emit_function(C64 *c, int fi) {
         mv[p].src_vec = -1;
         mv[p].src_reg = -1;
         mv[p].src_mem = -1;
-        if (s->force_stack && s->alloca_bytes > 8)
-            c64_die(c, s, "aggregate stack blob");
+        mv[p].is_blob = 0;
+        if (s->force_stack && s->alloca_bytes > 0) {
+            /* MEMORY blob: ir.c gave the parameter an address-valued type
+             * and pointed it at the incoming slot, exactly as x86 does with
+             * an LEA of [rbp+off].  Nothing is copied -- the callee reads the
+             * caller's outgoing area in place.  Honour the alignment ir.c
+             * recorded, then charge the object's size to the slot budget. */
+            int al = (s->align16 == 64) ? 64 : (s->align16 == 32) ? 32 : 16;
+            int byte = 8 * stack_arg_idx;
+            if (byte % al) byte += al - (byte % al);
+            mv[p].src_mem = save_total + byte;
+            stack_arg_idx = (byte + s->alloca_bytes + 7) / 8;
+            mv[p].is_blob = 1;
+            if (!param_is_used(fn, s->dst)) {
+                mv[p].done = 1;
+                continue;
+            }
+            int bhr = home_reg(c, s->dst);
+            mv[p].dst_reg = bhr >= 0 ? bhr : -1;
+            mv[p].dst_mem = bhr >= 0 ? -1 : spill_off(c, s->dst);
+            mv[p].is64 = 1;
+            continue;
+        }
         int is_sret = fn->sret_value >= 0 && s->dst == fn->sret_value;
         if (vec16_val(c, s->dst)) {
             int from_stack = s->force_stack || fp_idx >= 8;
@@ -4245,7 +4335,16 @@ static void emit_function(C64 *c, int fi) {
     for (int p = 0; p < nparams; p++) remaining += !mv[p].done;
 #define PM_EMIT(p) do {                                                      \
         PMove *_m = &mv[(p)];                                                \
-        if (_m->src_vec >= 0) {                                              \
+        if (_m->is_blob) {                                                   \
+            int _addr = SCR1;                                                \
+            a64_add_imm12(a, _addr, A64_FP, (unsigned)_m->src_mem, 0, 1, 0);  \
+            if (_m->dst_reg >= 0) {                                          \
+                if (_m->dst_reg != _addr)                                    \
+                    a64_mov_reg(a, _m->dst_reg, _addr, 1);                   \
+            } else {                                                         \
+                frame_store(c, _addr, _m->dst_mem, 8);                       \
+            }                                                                \
+        } else if (_m->src_vec >= 0) {                                       \
             int _tmp = _m->dst_reg >= 0 ? _m->dst_reg : SCR1;                \
             a64_fmov_gp(a, _tmp, _m->src_vec, 0, _m->is64);                  \
             if (_m->dst_reg < 0)                                             \
