@@ -113,6 +113,11 @@ typedef enum {
 /* Darwin HFA eightbyte: the SSA value is an integer bit pattern, but the
  * call boundary moves it through the next V register (not a GP). */
 #define CALL_ARG_HFA     32
+/* Stack argument that is an aggregate or vector: the SSA value is a pointer
+ * to it and call_arg_nbytes[] says how many bytes to copy there.  Used for
+ * anonymous variadic arguments, which take no register and so never went
+ * through the classification that used to size them. */
+#define CALL_ARG_AGG     64
 /* IR_CALL / IR_RETURN align16 on arm64.  x86 leaves these 0.
  * HFA: result eightbytes travel in v0/v1.  SRET: call_args[0] is the
  * indirect-result pointer and belongs in x8, not x0. */

@@ -7923,6 +7923,28 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
                 SysVRegClass cls[4];
                 int nreg;
                 int asz = type_size(arg->type);
+                /* An anonymous variadic argument has no register on Darwin:
+                 * every unnamed argument rides the vararg stack slots.
+                 * Classifying it as if it were named put a __m128 in an XMM
+                 * register the callee never reads, and va_arg then picked up
+                 * whatever happened to be on the stack -- which is why the
+                 * 16-byte vector case returned its low half and nothing
+                 * else.  Structs suffered the same way. */
+                if (darwin_unnamed_va(call_real_variadic, i, call_nparams,
+                                      call_fake_variadic)) {
+                    if (asz <= 0) asz = 8;
+                    if (nargs >= arg_limit) {
+                        fprintf(stderr, "fakecc: too many call arguments (max %d)\n",
+                                IR_CALL_MAX_ARGS);
+                        exit(1);
+                    }
+                    arg_vals[nargs] = av;
+                    arg_on_stack[nargs] = (unsigned char)
+                        (sysv_stack_arg_flags(1, arg->type) | CALL_ARG_AGG);
+                    arg_nbytes[nargs] = asz;
+                    nargs++;
+                    continue;
+                }
                 if (type_is_pair16(arg->type)) {
                     cls[0] = SYSV_CLS_INTEGER;
                     cls[1] = SYSV_CLS_INTEGER;

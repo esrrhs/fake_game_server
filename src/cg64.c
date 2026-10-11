@@ -2427,15 +2427,42 @@ static void emit_sat_builtin(C64 *c, const IRInst *s) {
     commit(c, s->dst, dst);
 }
 
-/* Byte count of a MEMORY-blob call argument, or 0 when this one is not a
- * blob.  ir.c hands the backend a pointer to the object plus the flag and
- * the size; anything missing falls back to 1 so the copy still happens. */
-static int call_arg_blob_bytes(const IRInst *inst, int k) {
-    if (!inst->call_arg_on_stack || !(inst->call_arg_on_stack[k] & CALL_ARG_BLOB))
+/* Byte count of a stack argument that reaches memory as a pointer to the
+ * object, or 0 when this one does not.  Two flags mean that: CALL_ARG_BLOB
+ * for a MEMORY-class aggregate and CALL_ARG_AGG for an aggregate or vector
+ * passed as an anonymous variadic argument.  ir.c hands over the size; a
+ * missing one falls back to 1 so the copy still happens. */
+
+/* Alignment the outgoing stack slot for a copy-in argument must carry.
+ * AAPCS64 rounds an anonymous argument's slot up to the argument's own
+ * alignment, and the callee's va_arg does the same rounding when it reads,
+ * so both sides have to agree -- CALL_ARG_AGG arguments take their alignment
+ * from ir.c, while a MEMORY blob parameter aligns its slot to 16. */
+static int copy_arg_align(unsigned char f) {
+    if (f & CALL_ARG_ALIGN64) return 64;
+    if (f & CALL_ARG_ALIGN32) return 32;
+    if (f & CALL_ARG_ALIGN16) return 16;
+    if (f & CALL_ARG_BLOB) return 16;
+    return 0;
+}
+
+static int call_arg_copy_bytes(const IRInst *inst, int k) {
+    if (!inst->call_arg_on_stack)
+        return 0;
+    unsigned char f = inst->call_arg_on_stack[k];
+    if (!(f & (CALL_ARG_BLOB | CALL_ARG_AGG)))
         return 0;
     if (inst->call_arg_nbytes && inst->call_arg_nbytes[k] > 0)
         return inst->call_arg_nbytes[k];
     return 1;
+}
+
+/* True when this stack argument is an object the caller copies into the
+ * outgoing area rather than passing a pointer to it.  AAPCS64 C.12 draws the
+ * line at 16 bytes: anything wider travels as a pointer to the object. */
+static int call_arg_is_inline_copy(const IRInst *inst, int k) {
+    int n = call_arg_copy_bytes(inst, k);
+    return n > 0 && n <= 16;
 }
 
 static int outgoing_stack_bytes(C64 *c, const IRInst *s) {
@@ -2456,15 +2483,19 @@ static int outgoing_stack_bytes(C64 *c, const IRInst *s) {
             fp++;
             continue;
         }
-        if (f & CALL_ARG_BLOB) {
+        int cpy = call_arg_copy_bytes(s, i);
+        /* AAPCS64 C.12: a composite larger than 16 bytes is passed
+         * indirectly -- the slot holds a pointer to it, which is what the
+         * callee's va_arg expects.  Only up-to-16-byte objects travel
+         * inline. */
+        if (cpy > 16) cpy = 0;
+        if (cpy) {
             /* Must match the reservation in the call sequence exactly, or the
              * outgoing area comes out smaller than the callee expects and the
              * object lands somewhere the callee never looks. */
-            int nb = call_arg_blob_bytes(s, i);
-            int al = (f & CALL_ARG_ALIGN64) ? 64
-                   : (f & CALL_ARG_ALIGN32) ? 32 : 16;
-            if (nb > 8 && (st % al)) st = (st + al - 1) & ~(al - 1);
-            st += nb;
+            int al = copy_arg_align((unsigned char)f);
+            if (al > 8 && (st % al)) st = (st + al - 1) & ~(al - 1);
+            st += (cpy + 7) & ~7;      /* slots are 8-byte granular */
         } else if ((f & CALL_ARG_STACK) || gp >= 8 || scalar || qv) {
             if (qv) {
                 if (st & 15) st = (st + 15) & ~15;
@@ -2569,10 +2600,23 @@ static void emit_va(C64 *c, const IRInst *s) {
     a64_ldr64(a, cur, ap, 0);
     int sz = s->imm > 0 ? (int)s->imm : 0;
     int indirect = sz > 16 || s->force_stack;
-    int adv = (sz == 0 || indirect) ? 8 : ((sz + 7) & ~7);
     int nxt = A64_X0;
     if (nxt == cur || nxt == ap) nxt = A64_X1;
     if (nxt == cur || nxt == ap) nxt = SCR0;
+    /* AAPCS64 rounds an anonymous argument's slot up to that argument's own
+     * alignment before reading it, and leaves *ap just past the object.  The
+     * caller rounds its outgoing slot the same way, so a 16-byte vector after
+     * an int lands in the same place on both sides. */
+    int al = (s->align16 >= 32) ? 32 : (s->align16 == 16 ? 16 : 0);
+    if (al > 8) {
+        a64_add_imm12(a, nxt, cur, (unsigned)(al - 1), 0, 1, 0);
+        a64_and_imm(a, nxt, nxt, (uint64_t)(~(uint64_t)(al - 1)), 1);
+        a64_mov_reg(a, cur, nxt, 1);
+    }
+    /* Every anonymous slot is a multiple of 8 bytes, which is what the caller
+     * reserves; rounding here keeps a small aggregate from sliding the
+     * arguments after it out of step. */
+    int adv = (sz == 0 || indirect) ? 8 : ((sz + 7) & ~7);
     a64_add_imm12(a, nxt, cur, (unsigned)adv, 0, 1, 0);
     a64_str64(a, nxt, ap, 0);
 
@@ -3305,18 +3349,18 @@ static void emit_call(C64 *c, const IRInst *s) {
         unsigned f = s->call_arg_on_stack ? s->call_arg_on_stack[i] : 0;
         int scalar = scalar_fp_val(c, s->call_args[i]);
         int qv = vec16_val(c, s->call_args[i]);
-        if (f & CALL_ARG_BLOB) {
-            /* MEMORY aggregate: the object is copied into the outgoing area
-             * (see the blob loop after the GP shuffle).  Reserve its bytes
-             * here, honouring the alignment ir.c asked for. */
-            int nb = call_arg_blob_bytes(s, i);
-            int al = (f & CALL_ARG_ALIGN64) ? 64
-                   : (f & CALL_ARG_ALIGN32) ? 32 : 16;
-            if (nb > 8 && (stk_bytes % al))
+        int cpyb = call_arg_copy_bytes(s, i);
+        if (cpyb > 16) cpyb = 0;    /* indirect: the normal pointer store */
+        if (cpyb) {
+            /* An object that reaches memory behind a pointer: reserve its
+             * bytes here and copy it before the GP shuffle (see the loop
+             * after the stack-argument stores). */
+            int al = copy_arg_align((unsigned char)f);
+            if (al > 8 && (stk_bytes % al))
                 stk_bytes = (stk_bytes + al - 1) & ~(al - 1);
             stk_at[stk_n] = i;
             stk_off[stk_n] = stk_bytes;
-            stk_bytes += nb;
+            stk_bytes += (cpyb + 7) & ~7;  /* slots are 8-byte granular */
             stk_n++;
             st_used++;
             continue;
@@ -3348,8 +3392,7 @@ static void emit_call(C64 *c, const IRInst *s) {
      * overwrite.  The area sits at [sp+0 ..).  A 16-byte vector occupies
      * one aligned Q slot once v0–v7 are full. */
     for (int i = 0; i < stk_n; i++) {
-        unsigned char af = s->call_arg_on_stack ? s->call_arg_on_stack[stk_at[i]] : 0;
-        if (af & CALL_ARG_BLOB) continue;   /* copied after the GP shuffle */
+        if (call_arg_is_inline_copy(s, stk_at[i])) continue;   /* copied later */
         IRValue av = s->call_args[stk_at[i]];
         int off = stk_off[i];
         if (vec16_val(c, av)) {
@@ -3373,9 +3416,8 @@ static void emit_call(C64 *c, const IRInst *s) {
      * third register for the chunk.  LDUR/STUR are unscaled, so neither
      * side has to be aligned. */
     for (int i = 0; i < stk_n; i++) {
-        unsigned char af = s->call_arg_on_stack ? s->call_arg_on_stack[stk_at[i]] : 0;
-        if (!(af & CALL_ARG_BLOB)) continue;
-        int nb = call_arg_blob_bytes(s, stk_at[i]);
+        if (!call_arg_is_inline_copy(s, stk_at[i])) continue;
+        int nb = call_arg_copy_bytes(s, stk_at[i]);
         int base = stk_off[i];
         /* Unsigned-offset forms: their Rn=31 means SP, while the unscaled
          * LDUR/STUR used by the rest of the frame helpers reads 31 as XZR
