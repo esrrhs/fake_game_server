@@ -495,7 +495,8 @@ static int stmt_takes_addr_of(const Stmt *s, const char *name) {
 static int64_t bitfield_mask64(int bit_width) {
     if (bit_width <= 0) return 0;
     if (bit_width >= 64) return -1;
-    return (1LL << bit_width) - 1;
+    /* unsigned: 1LL << 63 would overflow the signed type. */
+    return (int64_t)((1ULL << bit_width) - 1ULL);
 }
 
 static IRValue emit_bswap_val(IRFunction *fn, IRValue v, int uw, SourceLoc loc) {
