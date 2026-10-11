@@ -48,7 +48,14 @@ typedef struct {
     ParamArray last_fn_params;
     ParserLocalArray locals;
     int scope_depth;
+    int stmt_depth;
 } Parser;
+
+/* Recursive descent has no depth limit of its own: a few hundred nested
+ * statements (`{ { { ... } } }`, `if (x) if (x) ...`) exhaust the C stack,
+ * which under ASan happens around 500 levels.  Nothing real comes close —
+ * the deepest file in the test suite nests 15 — so diagnose instead. */
+#define MAX_STMT_DEPTH 256
 
 static const Token *synthesized_eof(void) {
     static Token eof_tok;
@@ -1682,6 +1689,7 @@ static long long parse_array_size_ext(Parser *p, Expr **dim_expr) {
         return -1; /* incomplete / flexible array member */
     }
     Expr *e = parse_expr(p);
+    if (!e) return FAKECC_ERR;   /* parse error, already reported */
     long long val = 0;
     if (fold_const_int(e, &val)) {
         if (val < 0) {
@@ -2450,7 +2458,8 @@ static Expr *parse_unary(Parser *p) {
         Expr *arg = parse_expr(p);
         expect_kind(p, TK_RPAREN, "')'");
         long long v;
-        int is_const = fold_const_int(arg, &v) || (arg->kind == EX_STR) || (arg->kind == EX_FLOAT_LIT);
+        int is_const = arg && (fold_const_int(arg, &v) ||
+                               arg->kind == EX_STR || arg->kind == EX_FLOAT_LIT);
         expr_free(arg);
         return expr_new_int(is_const ? 1 : 0, loc);
     }
@@ -2469,6 +2478,12 @@ static Expr *parse_unary(Parser *p) {
         expect_kind(p, TK_COMMA, "','");
         Expr *else_ = parse_assign(p);
         expect_kind(p, TK_RPAREN, "')'");
+        if (!cond || !then || !else_) {
+            expr_free(cond);
+            expr_free(then);
+            expr_free(else_);
+            return NULL;
+        }
         long long v;
         /* fold_const_int also folds float literals (truncated); those are not
          * integer constant expressions and GCC rejects them here. */
@@ -3811,7 +3826,22 @@ static Stmt parse_switch(Parser *p) {
     return s;
 }
 
+static Stmt parse_stmt_impl(Parser *p);
+
 static Stmt parse_stmt(Parser *p) {
+    if (p->stmt_depth >= MAX_STMT_DEPTH) {
+        const Token *t = peek(p);
+        die_at(t->loc.file, t->loc.line, t->loc.col,
+               "statement nesting level exceeded maximum of %d", MAX_STMT_DEPTH);
+        return (Stmt){0};
+    }
+    p->stmt_depth++;
+    Stmt s = parse_stmt_impl(p);
+    p->stmt_depth--;
+    return s;
+}
+
+static Stmt parse_stmt_impl(Parser *p) {
     if (fakecc_had_error()) return (Stmt){0};
     if (peek(p)->kind != TK_KW_TYPEDEF && !is_type_start(p, p->pos)) {
         for (;;) { if (!skip_attribute(p)) break; }
@@ -5291,6 +5321,7 @@ static int parse_in_pkg_impl(const TokenArray *tokens, TranslationUnit *tu, PkgC
     p.locals.len = 0;
     p.locals.cap = 0;
     p.scope_depth = 0;
+    p.stmt_depth = 0;
 
     g_parser_tu = tu;
     /* must start with package declaration */

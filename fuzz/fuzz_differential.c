@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 const char *__asan_default_options(void) {
@@ -30,6 +31,7 @@ static void tmp_path(char *buf, size_t n, const char *suffix) {
 /* gcc cannot parse fakecc's own dialect (package/import/runtime.*), so such a
  * program can never agree with gcc. */
 static int is_fakecc_dialect(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
     return strncmp(s, "package", 7) == 0 || strncmp(s, "import", 6) == 0 ||
            strstr(s, "runtime.") != NULL;
 }
@@ -46,12 +48,13 @@ static int looks_like_text(const uint8_t *d, size_t n) {
 }
 
 /* gcc 14 promoted several long-standing warnings to errors; keep them warnings
- * so that only real disagreements are reported. */
-static int gcc_accepts(const char *src) {
+ * so that only real disagreements are reported.
+ * Returns 1 = accepts, 0 = rejects, -1 = unknown (no gcc, or it timed out). */
+static int gcc_verdict(const char *src) {
     char path[512], cmd[1200];
     tmp_path(path, sizeof(path), ".c");
     FILE *f = fopen(path, "wb");
-    if (!f) return 1;
+    if (!f) return -1;
     fwrite(src, 1, strlen(src), f);
     fclose(f);
 
@@ -60,7 +63,10 @@ static int gcc_accepts(const char *src) {
              " -Wno-error=implicit-function-declaration -Wno-error=implicit-int"
              " -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
              " -Wno-error=return-mismatch %s >/dev/null 2>&1", path);
-    return system(cmd) == 0;
+    int status = system(cmd);
+    if (status < 0 || !WIFEXITED(status)) return -1;
+    if (WEXITSTATUS(status) == 124) return -1;   /* timeout(1) killed gcc */
+    return WEXITSTATUS(status) == 0 ? 1 : 0;
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -79,7 +85,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     tmp_path(obj, sizeof(obj), ".o");
     int fcc_accepts = fakecc_compile_string_to_obj(src, obj, &opts) == 0;
 
-    if (fcc_accepts && !is_fakecc_dialect(src) && !gcc_accepts(src)) {
+    if (fcc_accepts && !is_fakecc_dialect(src) && gcc_verdict(src) == 0) {
         fprintf(stderr, "fakecc accepted a program that gcc rejects:\n%s\n", src);
         abort();
     }

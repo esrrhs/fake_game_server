@@ -550,9 +550,12 @@ static int type_rank(Type t) {
 }
 
 /* Integer promotion (C §6.3.1.6): types narrower than int → int.
- * Float types are NOT integer-promoted — they keep their type. */
+ * Float types are NOT integer-promoted — they keep their type.
+ * Returns an owned copy: callers release their input right after, so handing
+ * back the argument itself would leave the result pointing at freed memory
+ * (the same rule usual_arith_conv() follows). */
 static Type integer_promote(Type t) {
-    if (t.kind == TY_FLOAT) return t;
+    if (t.kind == TY_FLOAT) return type_clone(t);
     /* C §6.3.1.1: a bit-field promotes to signed int if every value of the field fits in int. */
     if (t.bitfield_width > 0) {
         if (!t.is_unsigned) {
@@ -572,7 +575,7 @@ static Type integer_promote(Type t) {
         }
     }
     if (t.width < 4) return type_make_int(4, 0);
-    return t;
+    return type_clone(t);
 }
 
 /* Usual arithmetic conversions (C §6.3.1.8).

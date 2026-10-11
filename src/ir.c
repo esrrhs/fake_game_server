@@ -3986,6 +3986,13 @@ static IRValue lower_lvalue_addr(IRFunction *fn, IRSymTable *st, const Expr *e) 
     switch (e->kind) {
     case EX_VAR: {
         const IRSlot *entry = irsymtable_find(st, e->u.var.name);
+        if (!entry) {
+            /* Not a variable in scope: a function name used as an assignment
+             * target (`f *= 0`), which nothing has diagnosed yet.  Fail with a
+             * diagnostic instead of dereferencing NULL. */
+            return die_at(e->loc.file, e->loc.line, e->loc.col,
+                          "cannot assign to '%s'", e->u.var.name);
+        }
         if (entry->is_global) return emit_gaddr(fn, slot_global_name(entry), e->loc, entry->is_tls);
         if (entry->is_vla) {
             IRValue addr = emit_bin_w(fn, IR_ADDR, entry->slot, -1, 8, 1, e->loc);
