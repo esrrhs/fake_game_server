@@ -128,12 +128,6 @@ typedef struct {
     IROpcode op;
     IRValue  dst;      /* meaningless for IR_RETURN/IR_BR/IR_LABEL, fill -1 */
     IRValue  a, b;     /* source operands; IR_CONST only uses imm */
-    /* Third and fourth source operands.  Only IR_RETURN reads them, and
-     * only when fn->ret_reg_n > 2 -- an HFA of three or four elements,
-     * which AAPCS64 returns in v0-v3.  Nothing else looks at these, so an
-     * IRInst built with memset and no explicit initialisation is harmless:
-     * the consumers are gated on the return width, not on the field. */
-    IRValue  c, d;
     int64_t  imm;      /* CONST value, LABEL id, BR/CBR target, PARAM index */
     SourceLoc loc;
     /* IR_CALL only: callee name + argument SSA values.  NULL for other ops. */
@@ -266,7 +260,7 @@ typedef struct {
      * (1 or 2).  0 means MEMORY class — hidden sret pointer in RDI.
      * ret_reg_cls[i] holds SysVRegClass (INTEGER/SSE) for each eightbyte. */
     int   ret_reg_n;
-    int   ret_reg_cls[4];
+    int   ret_reg_cls[2];
     /* 1 if the function returns _Bool (normalize the value to 0/1). */
     int   ret_is_bool;
     /* 1 if the function returns `_Complex long double` in st0/st1. */

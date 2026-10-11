@@ -219,12 +219,6 @@ int scalar_dce(IRFunction *fn) {
         if (inst->a >= 0 && inst->a < fn->next_value_id) used[inst->a] = 1;
         if (inst->op != IR_CBR && inst->op != IR_CALL &&
             inst->b >= 0 && inst->b < fn->next_value_id) used[inst->b] = 1;
-        /* An IR_RETURN's c and d are the wide-HFA eightbytes; marking them
-         * used keeps whatever produces them alive. */
-        if (inst->op == IR_RETURN) {
-            if (inst->c >= 0 && inst->c < fn->next_value_id) used[inst->c] = 1;
-            if (inst->d >= 0 && inst->d < fn->next_value_id) used[inst->d] = 1;
-        }
         if (inst->op == IR_CALL) {
             for (int k = 0; k < inst->call_nargs; k++) {
                 int v = inst->call_args[k];
@@ -378,19 +372,7 @@ void scalar_renumber(IRFunction *fn) {
         if (inst->dst >= 0 && inst->dst < max_vid) inst->dst = map[inst->dst];
         if (inst->a >= 0 && inst->a < max_vid) inst->a = map[inst->a];
         if (inst->op != IR_CBR && inst->b >= 0 && inst->b < max_vid) inst->b = map[inst->b];
-        /* IR_RETURN's c and d hold the third and fourth eightbyte of a wide
-         * HFA result.  Leaving them on pre-compaction ids made them alias
-         * unrelated values, which then shared a register and the fourth
-         * element came back as a copy of the first. */
-        if (inst->op == IR_RETURN) {
-            if (inst->c >= 0 && inst->c < max_vid) inst->c = map[inst->c];
-            if (inst->d >= 0 && inst->d < max_vid) inst->d = map[inst->d];
-        }
         if (inst->op == IR_CALL) {
-            /* b was already remapped by the generic line above; c and d were
-             * not, because that line only knows about a and b. */
-            if (inst->c >= 0 && inst->c < max_vid) inst->c = map[inst->c];
-            if (inst->d >= 0 && inst->d < max_vid) inst->d = map[inst->d];
             if (inst->call_callee >= 0 && inst->call_callee < max_vid)
                 inst->call_callee = map[inst->call_callee];
             for (int k = 0; k < inst->call_nargs; k++) {
