@@ -21,6 +21,7 @@ static void push_inst(IRInstArray *a, IROpcode op, IRValue dst,
     IRInst inst;
     memset(&inst, 0, sizeof(inst));
     inst.op = op; inst.dst = dst; inst.a = arg1; inst.b = arg2;
+    inst.c = -1; inst.d = -1;
     inst.imm = imm; inst.width = 8; inst.call_callee = -1;
     a->data[a->len++] = inst;
 }

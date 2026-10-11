@@ -219,6 +219,12 @@ int scalar_dce(IRFunction *fn) {
         if (inst->a >= 0 && inst->a < fn->next_value_id) used[inst->a] = 1;
         if (inst->op != IR_CBR && inst->op != IR_CALL &&
             inst->b >= 0 && inst->b < fn->next_value_id) used[inst->b] = 1;
+        /* An IR_RETURN's c and d are the third/fourth wide-HFA eightbytes;
+         * mark them used so the loads that produce them survive. */
+        if (inst->op == IR_RETURN) {
+            if (inst->c >= 0 && inst->c < fn->next_value_id) used[inst->c] = 1;
+            if (inst->d >= 0 && inst->d < fn->next_value_id) used[inst->d] = 1;
+        }
         if (inst->op == IR_CALL) {
             for (int k = 0; k < inst->call_nargs; k++) {
                 int v = inst->call_args[k];
@@ -318,6 +324,10 @@ void scalar_renumber(IRFunction *fn) {
         if (inst->dst >= max_vid) max_vid = inst->dst + 1;
         if (inst->a >= max_vid) max_vid = inst->a + 1;
         if (inst->op != IR_CBR && inst->b >= max_vid) max_vid = inst->b + 1;
+        if ((inst->op == IR_CALL || inst->op == IR_RETURN) && inst->c >= 0) {
+            if (inst->c >= max_vid) max_vid = inst->c + 1;
+            if (inst->d >= max_vid) max_vid = inst->d + 1;
+        }
         if (inst->op == IR_CALL) {
             if (inst->call_callee >= max_vid) max_vid = inst->call_callee + 1;
             for (int k = 0; k < inst->call_nargs; k++) {
@@ -347,6 +357,14 @@ void scalar_renumber(IRFunction *fn) {
             map[inst->a] = next++;
         if (inst->op != IR_CBR && inst->b >= 0 && inst->b < max_vid && map[inst->b] == -1)
             map[inst->b] = next++;
+        /* IR_CALL's c/d are wide-HFA result eightbytes (defs); IR_RETURN's
+         * c/d are the matching uses.  Both must be kept in the compaction. */
+        if (inst->op == IR_CALL || inst->op == IR_RETURN) {
+            if (inst->c >= 0 && inst->c < max_vid && map[inst->c] == -1)
+                map[inst->c] = next++;
+            if (inst->d >= 0 && inst->d < max_vid && map[inst->d] == -1)
+                map[inst->d] = next++;
+        }
         if (inst->op == IR_CALL) {
             if (inst->call_callee >= 0 && inst->call_callee < max_vid && map[inst->call_callee] == -1)
                 map[inst->call_callee] = next++;
@@ -372,6 +390,13 @@ void scalar_renumber(IRFunction *fn) {
         if (inst->dst >= 0 && inst->dst < max_vid) inst->dst = map[inst->dst];
         if (inst->a >= 0 && inst->a < max_vid) inst->a = map[inst->a];
         if (inst->op != IR_CBR && inst->b >= 0 && inst->b < max_vid) inst->b = map[inst->b];
+        /* IR_RETURN reads c/d (the third/fourth wide-HFA eightbytes); IR_CALL
+         * defines them.  Leaving them on pre-compaction ids made them alias
+         * unrelated values, which then shared a register. */
+        if (inst->op == IR_RETURN || inst->op == IR_CALL) {
+            if (inst->c >= 0 && inst->c < max_vid) inst->c = map[inst->c];
+            if (inst->d >= 0 && inst->d < max_vid) inst->d = map[inst->d];
+        }
         if (inst->op == IR_CALL) {
             if (inst->call_callee >= 0 && inst->call_callee < max_vid)
                 inst->call_callee = map[inst->call_callee];

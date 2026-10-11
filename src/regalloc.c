@@ -264,14 +264,26 @@ static LiveInfo *compute_liveness(const IRFunction *fn) {
         if (inst->dst >= 0 && inst->dst < nv) {
             liv[inst->dst].def_point = (int)i;
         }
-        /* IR_CALL.b is a second return eightbyte (def), not a use. */
-        if (inst->op == IR_CALL && inst->b >= 0 && inst->b < nv)
-            liv[inst->b].def_point = (int)i;
+        /* IR_CALL.b/c/d are return eightbytes (defs), not uses.  c and d
+         * carry the third and fourth eightbyte of a wide HFA result, which
+         * AAPCS64 returns in v2/v3; other calls leave them at -1. */
+        if (inst->op == IR_CALL) {
+            if (inst->b >= 0 && inst->b < nv)
+                liv[inst->b].def_point = (int)i;
+            if (inst->c >= 0 && inst->c < nv)
+                liv[inst->c].def_point = (int)i;
+            if (inst->d >= 0 && inst->d < nv)
+                liv[inst->d].def_point = (int)i;
+        }
 
         /* Uses */
         if (inst->a >= 0 && inst->a < nv) liv_add_use(&liv[inst->a], (int)i);
         if (inst->op != IR_CBR && inst->op != IR_CALL &&
             inst->b >= 0 && inst->b < nv) liv_add_use(&liv[inst->b], (int)i);
+        if (inst->op == IR_RETURN) {
+            if (inst->c >= 0 && inst->c < nv) liv_add_use(&liv[inst->c], (int)i);
+            if (inst->d >= 0 && inst->d < nv) liv_add_use(&liv[inst->d], (int)i);
+        }
 
         /* IR_CALL: each call_args[k] is a use. */
         if (inst->op == IR_CALL) {
@@ -461,6 +473,14 @@ static void compute_use_def(const IRFunction *fn, const CFG *cfg,
                 if (!bs_test(&def_b[bi], inst->b))
                     bs_set(&use_b[bi], inst->b);
             }
+            if (inst->op == IR_RETURN) {
+                if (inst->c >= 0 && inst->c < use_b[bi].nv &&
+                    !bs_test(&def_b[bi], inst->c))
+                    bs_set(&use_b[bi], inst->c);
+                if (inst->d >= 0 && inst->d < use_b[bi].nv &&
+                    !bs_test(&def_b[bi], inst->d))
+                    bs_set(&use_b[bi], inst->d);
+            }
             if (inst->op == IR_CALL) {
                 for (int k = 0; k < inst->call_nargs; k++) {
                     IRValue av = inst->call_args[k];
@@ -484,10 +504,15 @@ static void compute_use_def(const IRFunction *fn, const CFG *cfg,
             if (inst->dst >= 0 && inst->dst < def_b[bi].nv) {
                 bs_set(&def_b[bi], inst->dst);
             }
-            /* IR_CALL.b: second return eightbyte. */
-            if (inst->op == IR_CALL && inst->b >= 0 &&
-                inst->b < def_b[bi].nv)
-                bs_set(&def_b[bi], inst->b);
+            /* IR_CALL.b/c/d: second, third and fourth return eightbyte. */
+            if (inst->op == IR_CALL) {
+                if (inst->b >= 0 && inst->b < def_b[bi].nv)
+                    bs_set(&def_b[bi], inst->b);
+                if (inst->c >= 0 && inst->c < def_b[bi].nv)
+                    bs_set(&def_b[bi], inst->c);
+                if (inst->d >= 0 && inst->d < def_b[bi].nv)
+                    bs_set(&def_b[bi], inst->d);
+            }
         }
     }
 }
@@ -592,6 +617,7 @@ static void build_interf_graph_cfg(const IRFunction *fn, const CFG *cfg,
             if (inst->op == IR_CALL) {
                 BS_FOREACH(&live, over) {
                     if ((int)over != inst->dst && (int)over != inst->b &&
+                        (int)over != inst->c && (int)over != inst->d &&
                         value_in_class(fn, (int)over, float_class, cls->exclude_16byte_ld))
                         forbid_mask[over] |= cls->caller_saved;
                 }
@@ -602,9 +628,16 @@ static void build_interf_graph_cfg(const IRFunction *fn, const CFG *cfg,
                 if (inst->op != IR_COPY)
                     bs_clr(&live, inst->dst);
             }
-            if (inst->op == IR_CALL && inst->b >= 0 && inst->b < nv &&
-                value_in_class(fn, inst->b, float_class, cls->exclude_16byte_ld))
-                bs_clr(&live, inst->b);
+            /* An IR_CALL's b/c/d are return eightbytes -- all defined here,
+             * all live on to the matching IR_RETURN.  Clear them as defs. */
+            if (inst->op == IR_CALL) {
+                IRValue dv[3] = { inst->b, inst->c, inst->d };
+                for (int q = 0; q < 3; q++) {
+                    if (dv[q] >= 0 && dv[q] < nv &&
+                        value_in_class(fn, dv[q], float_class, cls->exclude_16byte_ld))
+                        bs_clr(&live, dv[q]);
+                }
+            }
 
             if (inst->a >= 0 && inst->a < nv &&
                 value_in_class(fn, inst->a, float_class, cls->exclude_16byte_ld))
@@ -613,6 +646,14 @@ static void build_interf_graph_cfg(const IRFunction *fn, const CFG *cfg,
                 inst->b >= 0 && inst->b < nv &&
                 value_in_class(fn, inst->b, float_class, cls->exclude_16byte_ld))
                 bs_set(&live, inst->b);
+            if (inst->op == IR_RETURN) {
+                if (inst->c >= 0 && inst->c < nv &&
+                    value_in_class(fn, inst->c, float_class, cls->exclude_16byte_ld))
+                    bs_set(&live, inst->c);
+                if (inst->d >= 0 && inst->d < nv &&
+                    value_in_class(fn, inst->d, float_class, cls->exclude_16byte_ld))
+                    bs_set(&live, inst->d);
+            }
             if (inst->op == IR_CALL) {
                 for (int k = 0; k < inst->call_nargs; k++) {
                     IRValue av = inst->call_args[k];
@@ -680,15 +721,42 @@ static void build_interf_graph_cfg(const IRFunction *fn, const CFG *cfg,
                 if (inst->op != IR_COPY)
                     bs_clr(&live, inst->dst);
             }
-            if (inst->op == IR_CALL && inst->b >= 0 && inst->b < nv &&
-                value_in_class(fn, inst->b, float_class, cls->exclude_16byte_ld)) {
-                BS_FOREACH(&live, other) {
-                    if (!value_in_class(fn, (int)other, float_class, cls->exclude_16byte_ld))
+            /* An IR_CALL's b/c/d are return eightbytes -- all defined here,
+             * all live on to the matching IR_RETURN.  c and d carry the
+             * third and fourth eightbyte of a wide HFA result.
+             *
+             * They must also interfere with *each other*: the edges to the
+             * live set only reach what was already live, and none of them is
+             * live yet at its own definition point.  Without the pairwise
+             * edges two of the four came back sharing a register, so the
+             * third and fourth elements both held the second's bits. */
+            if (inst->op == IR_CALL) {
+                IRValue rv[3] = { inst->b, inst->c, inst->d };
+                for (int r = 0; r < 3; r++) {
+                    if (rv[r] < 0 || rv[r] >= nv) continue;
+                    if (!value_in_class(fn, rv[r], float_class,
+                                        cls->exclude_16byte_ld))
                         continue;
-                    if ((int)other != inst->b)
-                        ig_add_edge(g, inst->b, (int)other);
+                    BS_FOREACH(&live, other) {
+                        if (!value_in_class(fn, (int)other, float_class,
+                                            cls->exclude_16byte_ld))
+                            continue;
+                        if ((int)other != rv[r])
+                            ig_add_edge(g, rv[r], (int)other);
+                    }
                 }
-                bs_clr(&live, inst->b);
+                for (int r = 0; r < 3; r++)
+                    for (int q = r + 1; q < 3; q++) {
+                        if (rv[r] < 0 || rv[r] >= nv ||
+                            rv[q] < 0 || rv[q] >= nv) continue;
+                        ig_add_edge(g, rv[r], rv[q]);
+                    }
+                for (int r = 0; r < 3; r++) {
+                    if (rv[r] >= 0 && rv[r] < nv &&
+                        value_in_class(fn, rv[r], float_class,
+                                       cls->exclude_16byte_ld))
+                        bs_clr(&live, rv[r]);
+                }
             }
 
             if (inst->a >= 0 && inst->a < nv &&
@@ -698,6 +766,14 @@ static void build_interf_graph_cfg(const IRFunction *fn, const CFG *cfg,
                 inst->b >= 0 && inst->b < nv &&
                 value_in_class(fn, inst->b, float_class, cls->exclude_16byte_ld))
                 bs_set(&live, inst->b);
+            if (inst->op == IR_RETURN) {
+                if (inst->c >= 0 && inst->c < nv &&
+                    value_in_class(fn, inst->c, float_class, cls->exclude_16byte_ld))
+                    bs_set(&live, inst->c);
+                if (inst->d >= 0 && inst->d < nv &&
+                    value_in_class(fn, inst->d, float_class, cls->exclude_16byte_ld))
+                    bs_set(&live, inst->d);
+            }
             if (inst->op == IR_CALL) {
                 for (int k = 0; k < inst->call_nargs; k++) {
                     IRValue av = inst->call_args[k];
