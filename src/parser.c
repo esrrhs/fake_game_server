@@ -4984,7 +4984,9 @@ static FunctionDecl parse_function_decl(Parser *p) {
             /* Check if next token starts a type specifier (e.g., int, struct, typedef) */
             if (is_type_start(p, p->pos)) {
                 Type base = parse_specifiers(p);
-                Type extra_ty = parse_declarator(p, base, &extra_name);
+                /* parse_declarator() hands back `base` itself for a plain
+                 * declarator, so give it a copy: the caller frees both. */
+                Type extra_ty = parse_declarator(p, type_clone(base), &extra_name);
                 type_free(&base);
                 if (!extra_name) {
                     type_free(&extra_ty);
