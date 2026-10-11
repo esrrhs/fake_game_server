@@ -2633,15 +2633,19 @@ static void emit_va(C64 *c, const IRInst *s) {
     int nxt = A64_X0;
     if (nxt == cur || nxt == ap) nxt = A64_X1;
     if (nxt == cur || nxt == ap) nxt = SCR0;
-    /* AAPCS64 rounds an anonymous argument's slot up to that argument's own
-     * alignment before reading it, and leaves *ap just past the object.  The
-     * caller rounds its outgoing slot the same way, so a 16-byte vector after
-     * an int lands in the same place on both sides. */
+    /* Round this argument's slot up the way the caller rounded it -- on the
+     * *offset* from the start of the variadic area, not on the address.  The
+     * two only agree if both use the same quantity, and the address cannot
+     * serve: the stack is guaranteed 16-aligned, so rounding a 32-aligned
+     * argument's address up skipped a slot the caller had left alone and the
+     * callee faulted reading it. */
     int al = (s->align16 >= 32) ? 32 : (s->align16 == 16 ? 16 : 0);
     if (al > 8) {
-        a64_add_imm12(a, nxt, cur, (unsigned)(al - 1), 0, 1, 0);
-        a64_and_imm(a, nxt, nxt, (uint64_t)(~(uint64_t)(al - 1)), 1);
-        a64_mov_reg(a, cur, nxt, 1);
+        emit_fp_addr(c, SCR0, c->vararg_off);
+        a64_sub_reg(a, SCR1, cur, SCR0, A64_LSL, 0, 1, 0);
+        a64_add_imm12(a, SCR1, SCR1, (unsigned)(al - 1), 0, 1, 0);
+        a64_and_imm(a, SCR1, SCR1, (uint64_t)(~(uint64_t)(al - 1)), 1);
+        a64_add_reg(a, cur, SCR0, SCR1, A64_LSL, 0, 1, 0);
     }
     /* Every anonymous slot is a multiple of 8 bytes, which is what the caller
      * reserves; rounding here keeps a small aggregate from sliding the
