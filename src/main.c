@@ -344,6 +344,11 @@ int main(int argc, char **argv) {
             if (strstr(argv[i], "address")) g_sanitize_address = 1;
         } else if (strcmp(argv[i], "-g") == 0) {
             want_debug = 1;
+        } else if (strcmp(argv[i], "-pthread") == 0 ||
+                   strcmp(argv[i], "-pthreads") == 0) {
+            /* Accepted and ignored: nothing to do on a host where threads are
+             * part of libc (Darwin keeps them in libSystem).  Taking it as an
+             * error only pushed callers to spell the flag differently. */
         } else if (strcmp(argv[i], "-mno-avx") == 0) {
             g_no_avx = 1;
             g_avx512f = 0;
