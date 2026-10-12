@@ -8250,7 +8250,9 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
             /* `__syscall` is an intrinsic — treat it as a named call so codegen
              * emits the raw `syscall` instruction.  It is not in the function
              * table, so the direct-call lookup below would miss it. */
-            if (strcmp(cname, "__syscall") == 0 || strcmp(cname, "__clone") == 0) {
+            if (strcmp(cname, "__syscall") == 0 || strcmp(cname, "__clone") == 0
+                || strcmp(cname, "__paciasp") == 0 || strcmp(cname, "__pacia") == 0
+                || strcmp(cname, "__autda") == 0 || strcmp(cname, "__retab") == 0) {
                 inst.call_name = xstrdup(cname);
             } else if (strcmp(cname, "__builtin_ctzll") == 0) {
                 /* ctz intrinsic — codegen emits a `bsf` + fixup. */

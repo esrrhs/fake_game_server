@@ -569,6 +569,7 @@ static int find_function(const IRModule *ir, const char *name, int *idx_out) {
 }
 
 static void emit_syscall(C64 *c, const IRInst *s);
+static int emit_pac_builtin(C64 *c, const IRInst *s);
 
 /* malloc/free/calloc via Darwin mmap/munmap when this TU does not define
  * them.  The block stores its mapped length in the 16 bytes before the
@@ -3121,6 +3122,9 @@ static void emit_call(C64 *c, const IRInst *s) {
         emit_syscall(c, s);
         return;
     }
+    if (s->call_name && emit_pac_builtin(c, s)) {
+        return;
+    }
     if (s->call_name && strcmp(s->call_name, "__builtin_apply_args") == 0) {
         /* The block was filled by the prologue; hand back its address. */
         int d = dst_reg(c, s->dst);
@@ -3879,6 +3883,50 @@ static int64_t c64_darwin_syscall(int64_t num) {
     case 231: return 1;  /* exit_group -> exit: Darwin has no group */
     default: return num; /* futex(202), clone(56): no equivalent exists */
     }
+}
+
+/* Pointer-authentication intrinsics: __paciasp() / __pacia(rt) /
+ * __autda(rt, rn) / __retab().  Darwin's thread machinery authenticates the
+ * function pointer it hands to bsdthread_register, and libsystem_pthread
+ * authenticates on every return, so a runtime that talks to the kernel
+ * directly needs the same pair.  The instructions are HINT-space, so on a
+ * process that did not opt in they do nothing -- which is exactly what a
+ * runtime that ignores the signature needs. */
+static int emit_pac_builtin(C64 *c, const IRInst *s) {
+    A64Asm *a = c->as;
+    if (!s->call_name) return 0;
+    if (strcmp(s->call_name, "__paciasp") == 0) {
+        a64_paciasp(a);
+        return 1;
+    }
+    if (strcmp(s->call_name, "__retab") == 0) {
+        a64_retab(a);
+        return 1;
+    }
+    if (strcmp(s->call_name, "__pacia") == 0) {
+        if (s->call_nargs < 1) c64_die(c, s, "__pacia without argument");
+        int r = load_op(c, s->call_args[0], -1);
+        a64_pacia(a, r);
+        if (s->dst >= 0) {
+            int d = dst_reg(c, s->dst);
+            if (d != r) a64_mov_reg(a, d, r, 1);
+            commit(c, s->dst, d);
+        }
+        return 1;
+    }
+    if (strcmp(s->call_name, "__autda") == 0) {
+        if (s->call_nargs < 2) c64_die(c, s, "__autda needs two arguments");
+        int rt = load_op(c, s->call_args[0], -1);
+        int rn = load_op(c, s->call_args[1], -1);
+        a64_autda(a, rt, rn);
+        if (s->dst >= 0) {
+            int d = dst_reg(c, s->dst);
+            if (d != rt) a64_mov_reg(a, d, rt, 1);
+            commit(c, s->dst, d);
+        }
+        return 1;
+    }
+    return 0;
 }
 
 static void emit_syscall(C64 *c, const IRInst *s) {

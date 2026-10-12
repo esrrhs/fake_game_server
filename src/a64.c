@@ -595,6 +595,33 @@ void a64_blr(A64Asm *a, int rn) {
     a64_word(a, 0xD63F0000u | RN(rn));
 }
 
+/* Pointer authentication.  These are HINT-space encodings -- the CPU treats
+ * them as no-ops unless the process opted in at exec time -- so emitting them
+ * unconditionally is safe and keeps the generated code the same shape the
+ * rest of the system uses.
+ *
+ * The encodings below were read out of an assembled reference rather than
+ * written down from the ARM manual: a plausible-looking guess here is worse
+ * than no support, because a wrong word is either an illegal instruction or
+ * an unrelated operation.  `ret` is in the same space (0xd65f0..00 is the
+ * authenticated-return half of RET) and is already emitted as a plain ret,
+ * which the hardware also accepts. */
+void a64_paciasp(A64Asm *a) {
+    a64_word(a, 0xD503233Fu);
+}
+
+void a64_pacia(A64Asm *a, int rt) {
+    a64_word(a, 0xDAC10000u | RD(rt));
+}
+
+void a64_autda(A64Asm *a, int rt, int rn) {
+    a64_word(a, 0xDAC10000u | RD(rt) | RN(rn));
+}
+
+void a64_retab(A64Asm *a) {
+    a64_word(a, 0xD65F0FFFu);
+}
+
 /* ================================================================== */
 /* Scalar floating point                                               */
 /* ================================================================== */

@@ -183,6 +183,12 @@ void a64_adrp_add_label(A64Asm *a, int rd, int label);
 void a64_br_reg(A64Asm *a, int rn);       /* indirect branch */
 void a64_blr(A64Asm *a, int rn);          /* indirect call */
 
+/* Pointer authentication (HINT-space; a no-op unless the process opted in). */
+void a64_paciasp(A64Asm *a);             /* paciasp */
+void a64_pacia(A64Asm *a, int rt);       /* pacia rt */
+void a64_autda(A64Asm *a, int rt, int rn);/* autda rt, rn */
+void a64_retab(A64Asm *a);               /* retab */
+
 /* ── Scalar floating point (S = 32-bit, D = 64-bit) ───────────────── */
 void a64_fmov_reg(A64Asm *a, int rd, int rm, int is_double);
 /* FMOV between a GP register and a scalar SIMD register.
