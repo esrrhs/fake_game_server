@@ -3,6 +3,7 @@
 #include "fakecc/macho.h"
 #include "fakecc/reg_arm64.h"
 #include "fakecc/common.h"
+#include "fakecc/target.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -82,8 +83,15 @@ typedef struct {
     size_t           *goff;
     /* ADRP+ADD pairs targeting globals; patched once the final section
      * placement (which depends on the total text length) is known. */
-    struct GFix { uint32_t at; int gidx; const char *name; int value; int addend; int got; int tlvp; } *gfix;
+    struct GFix { uint32_t at; int gidx; const char *name; int value; int addend; int got; int tlvp; int bind; } *gfix;
     size_t            ngfix, capgfix;
+    /* Exec-mode import slots: one 8-byte cell per dylib symbol, at these
+     * offsets in __data.  dyld writes the symbol's address into the cell,
+     * and the stub loads through it.  A GFix entry with bind >= 0 indexes
+     * this array instead of the globals. */
+    size_t           *bind_off;
+    const char      **bind_name;
+    size_t            nbind, capbind;
     /* First gfix entry belonging to the function being compiled.  IR value
      * ids are allocated per function and collide across functions, so
      * fold_page_addend may only match entries inside this range; entries of
@@ -160,7 +168,23 @@ static void note_page_reloc(C64 *c, uint32_t at, int gidx, const char *name,
     c->gfix[c->ngfix].addend = 0;
     c->gfix[c->ngfix].got = 0;
     c->gfix[c->ngfix].tlvp = 0;
+    c->gfix[c->ngfix].bind = -1;
     c->ngfix++;
+}
+
+/* One 8-byte slot in __data per dylib symbol this module imports, reused
+ * when the same symbol is called more than once.  Returns its index. */
+static size_t c64_bind_slot(C64 *c, const char *name) {
+    for (size_t i = 0; i < c->nbind; i++)
+        if (strcmp(c->bind_name[i], name) == 0) return i;
+    if (c->nbind == c->capbind) {
+        c->capbind = c->capbind ? c->capbind * 2 : 4;
+        c->bind_off = xrealloc(c->bind_off, c->capbind * sizeof *c->bind_off);
+        c->bind_name = xrealloc(c->bind_name, c->capbind * sizeof *c->bind_name);
+    }
+    c->bind_name[c->nbind] = name;
+    c->bind_off[c->nbind] = 0; /* filled once __data's layout is settled */
+    return c->nbind++;
 }
 
 /* ADRP+ADD of the exec-mode envp slot.  Patched with the other page relocs. */
@@ -3789,8 +3813,16 @@ static void emit_call(C64 *c, const IRInst *s) {
         } else if (find_function(c->ir, s->call_name, &fi) != 0) {
             /* Not in this TU.  Under -c and in a multi-TU link a sibling may
              * define it, so route the call through a stub the linker
-             * retargets; only a lone single-TU link has nowhere to look. */
-            if (!emit_object_mode() && !emit_multi_tu())
+             * retargets; only a lone single-TU link has nowhere to look.
+             *
+             * A libSystem symbol is the third case: it is defined nowhere
+             * in the program, but dyld can bind it at load time from the
+             * LC_LOAD_DYLIB every executable already carries.  Those names
+             * come from an explicit list, so an ordinary misspelling still
+             * stops here rather than at launch. */
+            int importable = emit_is_darwin_import(s->call_name)
+                          && target_current()->os == TOS_MACOS;
+            if (!emit_object_mode() && !emit_multi_tu() && !importable)
                 die_at(s->loc.file ? s->loc.file : c->fn->loc.file,
                        s->loc.line, s->loc.col,
                        "arm64 backend: call to undefined function '%s'",
@@ -5960,13 +5992,42 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
      * text relocations itself, so a BRANCH26 to the final address is both
      * correct and cheaper.  Pick by which path this module will take. */
     for (size_t i = 0; i < c.nstub; i++) {
+        const char *sname = c.stub[i].name;
+        int import = emit_is_darwin_import(sname)
+                  && target_current()->os == TOS_MACOS;
         a64_bind(&a, c.stub[i].lab);
-        if (emit_object_mode()) {
-            note_page_reloc(&c, (uint32_t)a.code.len, -1, c.stub[i].name, -1);
+        if (emit_object_mode() || (emit_multi_tu() && import)) {
+            note_page_reloc(&c, (uint32_t)a.code.len, -1, sname, -1);
             c.gfix[c.ngfix - 1].got = 1;
             a64_word(&a, 0x90000000u | (uint32_t)A64_X16);
             a64_word(&a, 0xF9400000u | ((uint32_t)A64_X16 << 5)
                                  | (uint32_t)A64_X16);
+            a64_br_reg(&a, A64_X16);
+        } else if (import) {
+            /* A freestanding image has no GOT, so it carries its own: one
+             * 8-byte cell in __data per symbol, which dyld overwrites with
+             * the address.  The cell is laid out here, before the section
+             * bases are known, and the ADRP+ADD pair that reaches it is
+             * patched with the rest of the globals below.  x16 is the
+             * scratch Apple's own stubs use, so nothing has to be saved. */
+            while (out->data.len % 8) {
+                char z = 0;
+                buffer_append(&out->data, &z, 1);
+            }
+            if (out->data_align < 8) out->data_align = 8;
+            size_t bi = c64_bind_slot(&c, sname);
+            c.bind_off[bi] = out->data.len;
+            for (int k = 0; k < 8; k++) {
+                char z = 0;
+                buffer_append(&out->data, &z, 1);
+            }
+            note_page_reloc(&c, (uint32_t)a.code.len, -1, sname, -1);
+            c.gfix[c.ngfix - 1].bind = (int)bi;
+            a64_word(&a, 0x90000000u | (uint32_t)A64_X16); /* adrp x16, page */
+            a64_word(&a, 0x91000000u | ((uint32_t)A64_X16 << 5)
+                                    | (uint32_t)A64_X16);  /* add x16, x16, #off */
+            a64_word(&a, 0xF9400000u | ((uint32_t)A64_X16 << 5)
+                                    | (uint32_t)A64_X16);  /* ldr x16, [x16] */
             a64_br_reg(&a, A64_X16);
         } else {
             /* A single BL, not an ADRP+ADD pair, so it cannot ride the
@@ -6048,7 +6109,11 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
                 continue;
             }
             uint64_t tgt;
-            if (gi < 0) {
+            if (c.gfix[i].bind >= 0) {
+                tgt = data_off + (uint64_t)c.bind_off[c.gfix[i].bind]
+                    + (uint64_t)c.gfix[i].addend;
+                emit_module_add_bind(out, tgt, c.gfix[i].name);
+            } else if (gi < 0) {
                 tgt = bss_off + (uint64_t)c.environ_off
                     + (uint64_t)c.gfix[i].addend;
             } else {
@@ -6298,6 +6363,8 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
     free(c.pfix);
     free(c.xcall);
     free(c.stub);
+    free(c.bind_off);
+    free(c.bind_name);
     for (size_t i = 0; i < c.nlrel; i++) free(c.lrel[i].name);
     free(c.lrel);
     free(c.gsect);

@@ -33,6 +33,17 @@ typedef struct {
     uint64_t target;
 } EmitRebase;
 
+/* arm64 Mach-O import.  Where a rebase names an address inside the image,
+ * a bind names one outside it: `slot` is a pointer-sized cell in __DATA
+ * (an offset from the mach header) that dyld overwrites with the address
+ * of `name` as it loads the dylibs.  The cell is what makes a call to a
+ * library function possible at all -- there is no displacement a direct
+ * branch could hold, because the distance is not known until load time. */
+typedef struct {
+    uint64_t slot;
+    char    *name;     /* Mach-O spelling, i.e. already "_"-prefixed */
+} EmitBind;
+
 typedef struct {
     char *name;        /* symbol name (NULL for section symbols) */
     uint8_t binding;   /* STB_LOCAL (0) / STB_GLOBAL (1) */
@@ -226,6 +237,9 @@ typedef struct EmitModule {
     /* Pointer slots dyld must rebase (arm64 Mach-O PIE). */
     EmitRebase *rebases;
     size_t num_rebases, cap_rebases;
+    /* Pointer slots dyld must bind to a dylib symbol (arm64 Mach-O). */
+    EmitBind *binds;
+    size_t num_binds, cap_binds;
 
     /* Debug info (-g).  Empty when compiled without -g. */
     char *dbg_tu_name;           /* primary source file name */
@@ -271,6 +285,16 @@ void emit_module_add_data_reloc(EmitModule *m, size_t offset, uint32_t type,
                                 int sym, int32_t addend);
 /* Record one arm64 image-relative pointer rebase (see EmitRebase). */
 void emit_module_add_rebase(EmitModule *m, uint64_t slot, uint64_t target);
+/* Record one arm64 dylib import (see EmitBind).  `name` is the C spelling;
+ * the Mach-O "_" prefix is added here, so callers pass "pthread_create". */
+void emit_module_add_bind(EmitModule *m, uint64_t slot, const char *name);
+
+/* True when `name` is a function the arm64 backend may import from
+ * libSystem instead of requiring a definition in the program.  The list is
+ * deliberately explicit: an undefined call that is not on it still fails at
+ * compile time, which is what keeps a misspelled name a diagnostic rather
+ * than a launch-time "symbol not found" from dyld. */
+int emit_is_darwin_import(const char *name);
 
 /* ------------------------------------------------------------------ */
 /* Output                                                              */

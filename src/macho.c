@@ -211,14 +211,6 @@ static void put_u16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 static void put_u32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 static void put_u64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
 
-static int rebase_cmp(const void *a, const void *b) {
-    const EmitRebase *x = a;
-    const EmitRebase *y = b;
-    if (x->slot < y->slot) return -1;
-    if (x->slot > y->slot) return 1;
-    return 0;
-}
-
 /* DYLD_CHAINED_PTR_64_OFFSET (pointer format 6).  `target` is the vm
  * offset from the mach header; dyld adds the actual load address.
  * Bit layout is dyld_chained_ptr_64_rebase (mach-o/fixup-chains.h):
@@ -230,14 +222,45 @@ static uint64_t encode_chain_ptr(uint64_t target, uint32_t next) {
     return (target & 0xFFFFFFFFFull) | ((uint64_t)(next & 0xFFFu) << 51);
 }
 
-/* Encode em->rebases into __data and build the LC_DYLD_CHAINED_FIXUPS
- * payload plus an empty exports trie.  Only __DATA is chained; const
- * data that contains pointers is placed there by codegen64. */
+/* One link in a __DATA fixup chain.  A rebase names an address inside the
+ * image; a bind names a symbol dyld has to find in a dylib, and carries the
+ * index of that symbol in the imports table instead of an address. */
+typedef struct {
+    uint64_t slot;
+    uint64_t target;   /* rebase */
+    uint32_t ordinal;  /* bind */
+    int      is_bind;
+} ChainEnt;
+
+static int chain_cmp(const void *a, const void *b) {
+    const ChainEnt *x = a;
+    const ChainEnt *y = b;
+    if (x->slot < y->slot) return -1;
+    if (x->slot > y->slot) return 1;
+    return 0;
+}
+
+/* DYLD_CHAINED_PTR_64_OFFSET with the bind bit set, i.e.
+ * dyld_chained_ptr_64_bind (mach-o/fixup-chains.h):
+ *   ordinal 24 | addend 8 | reserved 19 | next 12 | bind 1
+ * `addend` is an unsigned byte and is 0 throughout: nothing here binds a
+ * symbol-plus-offset. */
+static uint64_t encode_bind_ptr(uint32_t ordinal, uint32_t next) {
+    return ((uint64_t)(ordinal & 0xFFFFFFu))
+         | ((uint64_t)(next & 0xFFFu) << 51)
+         | (1ull << 63);
+}
+
+/* Encode em->rebases and em->binds into __data and build the
+ * LC_DYLD_CHAINED_FIXUPS payload plus an empty exports trie.  Only __DATA
+ * is chained; const data that contains pointers is placed there by
+ * codegen64.  Both kinds share one chain per page, so an entry's `next`
+ * stride is measured to whichever kind follows it. */
 static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
                               uint64_t data_file, char **data_img_out,
                               Buffer *fixblob, Buffer *trie) {
     if (!em->data.len || data_file == 0) {
-        fprintf(stderr, "fakecc: rebase with empty __data\n");
+        fprintf(stderr, "fakecc: fixup with empty __data\n");
         return -1;
     }
     uint32_t page_count = (uint32_t)(data_file / MACHO_PAGE_SIZE);
@@ -246,69 +269,101 @@ static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
         return -1;
     }
 
-    EmitRebase *r = xmalloc(em->num_rebases * sizeof *r);
-    memcpy(r, em->rebases, em->num_rebases * sizeof *r);
-    qsort(r, em->num_rebases, sizeof *r, rebase_cmp);
+    size_t n = em->num_rebases + em->num_binds;
+    ChainEnt *ce = xmalloc((n ? n : 1) * sizeof *ce);
+    for (size_t i = 0; i < em->num_rebases; i++) {
+        ce[i].slot = em->rebases[i].slot;
+        ce[i].target = em->rebases[i].target;
+        ce[i].ordinal = 0;
+        ce[i].is_bind = 0;
+    }
+    /* Imports are deduplicated by name: one entry per symbol, and every
+     * cell that needs it cites the same ordinal. */
+    const char **imp_name = NULL;
+    size_t nimp = 0, capimp = 0;
+    for (size_t i = 0; i < em->num_binds; i++) {
+        const char *nm = em->binds[i].name;
+        uint32_t ord = 0;
+        int found = 0;
+        for (size_t k = 0; k < nimp; k++)
+            if (strcmp(imp_name[k], nm) == 0) { ord = (uint32_t)k; found = 1; break; }
+        if (!found) {
+            if (nimp == capimp) {
+                capimp = capimp ? capimp * 2 : 4;
+                imp_name = xrealloc(imp_name, capimp * sizeof *imp_name);
+            }
+            imp_name[nimp] = nm;
+            ord = (uint32_t)nimp;
+            nimp++;
+        }
+        ce[em->num_rebases + i].slot = em->binds[i].slot;
+        ce[em->num_rebases + i].target = 0;
+        ce[em->num_rebases + i].ordinal = ord;
+        ce[em->num_rebases + i].is_bind = 1;
+    }
+    qsort(ce, n, sizeof *ce, chain_cmp);
 
     char *img = xmalloc(em->data.len);
     memcpy(img, em->data.data, em->data.len);
 
-    for (size_t i = 0; i < em->num_rebases; i++) {
-        if (r[i].slot < data_page ||
-            r[i].slot + 8 > data_page + em->data.len) {
-            fprintf(stderr, "fakecc: rebase slot %#llx outside __data\n",
-                    (unsigned long long)r[i].slot);
-            free(r);
-            free(img);
+    for (size_t i = 0; i < n; i++) {
+        if (ce[i].slot < data_page ||
+            ce[i].slot + 8 > data_page + em->data.len) {
+            fprintf(stderr, "fakecc: fixup slot %#llx outside __data\n",
+                    (unsigned long long)ce[i].slot);
+            free(ce); free(imp_name); free(img);
             return -1;
         }
-        uint64_t off = r[i].slot - data_page;
+        uint64_t off = ce[i].slot - data_page;
         if ((off & 7) || (off % MACHO_PAGE_SIZE) + 8 > MACHO_PAGE_SIZE) {
-            fprintf(stderr, "fakecc: rebase slot %#llx is not an in-page "
-                    "8-byte pointer\n", (unsigned long long)r[i].slot);
-            free(r);
-            free(img);
+            fprintf(stderr, "fakecc: fixup slot %#llx is not an in-page "
+                    "8-byte pointer\n", (unsigned long long)ce[i].slot);
+            free(ce); free(imp_name); free(img);
             return -1;
         }
-        if (r[i].target > 0xFFFFFFFFFull) {
+        if (!ce[i].is_bind && ce[i].target > 0xFFFFFFFFFull) {
             fprintf(stderr, "fakecc: rebase target exceeds 36 bits\n");
-            free(r);
-            free(img);
+            free(ce); free(imp_name); free(img);
             return -1;
         }
         uint32_t next = 0;
-        if (i + 1 < em->num_rebases) {
-            uint64_t off2 = r[i + 1].slot - data_page;
+        if (i + 1 < n) {
+            uint64_t off2 = ce[i + 1].slot - data_page;
             if ((off / MACHO_PAGE_SIZE) == (off2 / MACHO_PAGE_SIZE)) {
-                uint64_t dist = r[i + 1].slot - r[i].slot;
+                uint64_t dist = ce[i + 1].slot - ce[i].slot;
                 if (dist == 0 || (dist & 3) || dist / 4 > 0xFFF) {
-                    fprintf(stderr, "fakecc: rebase chain stride out of range\n");
-                    free(r);
-                    free(img);
+                    fprintf(stderr, "fakecc: fixup chain stride out of range\n");
+                    free(ce); free(imp_name); free(img);
                     return -1;
                 }
                 next = (uint32_t)(dist / 4);
             }
         }
-        uint64_t enc = encode_chain_ptr(r[i].target, next);
+        uint64_t enc = ce[i].is_bind ? encode_bind_ptr(ce[i].ordinal, next)
+                                     : encode_chain_ptr(ce[i].target, next);
         memcpy(img + (size_t)off, &enc, 8);
     }
 
     /* header (28) padded to 32, then starts-in-image for the four
      * segments.  Segment info is 8-aligned, so it begins at starts+24
-     * (ld64 does the same).  imports_count is 0; the trailing 8 zero
-     * bytes match the ld64 blob. */
+     * (ld64 does the same).  With no imports the trailing 8 zero bytes
+     * match the ld64 blob. */
     uint32_t starts_off = 32;
     uint32_t seg_at = 56;
     uint32_t raw = 22u + 2u * page_count;
     uint32_t seg_size = (raw + 7u) & ~7u;
     uint32_t imports_off = seg_at + seg_size;
-    uint32_t blob_size = imports_off + 8;
+    uint32_t symbols_off = imports_off + (uint32_t)nimp * 4u;
+    size_t pool = 0;
+    for (size_t k = 0; k < nimp; k++) pool += strlen(imp_name[k]) + 1;
+    uint32_t blob_size = symbols_off + (uint32_t)pool;
+    if (!nimp) blob_size += 8;
     uint8_t *blob = xmalloc(blob_size);
     memset(blob, 0, blob_size);
     put_u32(blob + 4, starts_off);
     put_u32(blob + 8, imports_off);
-    put_u32(blob + 12, imports_off);
+    put_u32(blob + 12, symbols_off);
+    put_u32(blob + 16, (uint32_t)nimp);
     put_u32(blob + 20, 1);                         /* DYLD_CHAINED_IMPORT */
     put_u32(blob + starts_off, 4);                 /* seg_count */
     put_u32(blob + starts_off + 12, 24);           /* seg_info_offset[2] */
@@ -319,8 +374,8 @@ static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
     put_u16(blob + seg_at + 20, (uint16_t)page_count);
     for (uint32_t p = 0; p < page_count; p++)
         put_u16(blob + seg_at + 22 + 2u * p, 0xFFFF);
-    for (size_t i = 0; i < em->num_rebases; i++) {
-        uint64_t off = r[i].slot - data_page;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t off = ce[i].slot - data_page;
         uint32_t pg = (uint32_t)(off / MACHO_PAGE_SIZE);
         uint16_t cur = 0;
         memcpy(&cur, blob + seg_at + 22 + 2u * pg, 2);
@@ -328,9 +383,20 @@ static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
             put_u16(blob + seg_at + 22 + 2u * pg,
                     (uint16_t)(off % MACHO_PAGE_SIZE));
     }
+    /* dyld_chained_import: lib_ordinal 8 | weak_import 1 | name_offset 23.
+     * libSystem.B.dylib is the one LC_LOAD_DYLIB this image carries, so
+     * every import resolves against ordinal 1. */
+    size_t at = 0;
+    for (size_t k = 0; k < nimp; k++) {
+        put_u32(blob + imports_off + 4u * k,
+                (uint32_t)(1u | ((at & 0x7FFFFFu) << 9)));
+        memcpy(blob + symbols_off + at, imp_name[k], strlen(imp_name[k]) + 1);
+        at += strlen(imp_name[k]) + 1;
+    }
     buffer_append(fixblob, (const char *)blob, blob_size);
     free(blob);
-    free(r);
+    free(ce);
+    free(imp_name);
 
     char empty_trie[2] = {0, 0};
     buffer_append(trie, empty_trie, 2);
@@ -421,7 +487,7 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     Buffer fixblob, trieblob;
     buffer_init(&fixblob);
     buffer_init(&trieblob);
-    int has_fix = em->num_rebases > 0;
+    int has_fix = em->num_rebases > 0 || em->num_binds > 0;
     if (has_fix &&
         macho_build_fixups(em, data_page, data_file, &data_img,
                            &fixblob, &trieblob) != 0) {
@@ -1966,6 +2032,17 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                         off = 0;
                         found = 2; /* weak and absent: address 0, call returns 0 */
                     }
+                    /* A libSystem symbol is absent by design: nothing in the
+                     * program defines it, and dyld binds it from the
+                     * LC_LOAD_DYLIB the final image already carries.  It has
+                     * to be reached through a GOT cell -- there is no
+                     * displacement between here and a dylib to patch into a
+                     * branch -- which is exactly what the reloc asks for. */
+                    if (!found && es->name && emit_is_darwin_import(es->name)) {
+                        sh = 0;
+                        off = 0;
+                        found = 3;
+                    }
                     if (!found) {
                         fprintf(stderr, "fakecc: undefined symbol '%s'\n",
                                 es->name ? es->name : "?");
@@ -2037,7 +2114,10 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                         }
                         uint64_t got_va = data_off + got_base + (uint64_t)slot * 8;
                         if (!gots[slot].filled) {
-                            emit_module_add_rebase(&out, got_va, tgt);
+                            if (found == 3)
+                                emit_module_add_bind(&out, got_va, es->name);
+                            else
+                                emit_module_add_rebase(&out, got_va, tgt);
                             gots[slot].filled = 1;
                         }
                         if (r->type == 5) patch_adrp(&w, pc, got_va);

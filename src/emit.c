@@ -44,6 +44,7 @@ void emit_module_init(EmitModule *m) {
     m->relocs = NULL; m->num_relocs = 0; m->cap_relocs = 0;
     m->data_relocs = NULL; m->num_data_relocs = 0; m->cap_data_relocs = 0;
     m->rebases = NULL; m->num_rebases = 0; m->cap_rebases = 0;
+    m->binds = NULL; m->num_binds = 0; m->cap_binds = 0;
     m->dbg_tu_name = NULL;
     m->dbg_lines = NULL; m->num_dbg_lines = 0; m->cap_dbg_lines = 0;
     m->dbg_funcs = NULL; m->num_dbg_funcs = 0; m->cap_dbg_funcs = 0;
@@ -60,6 +61,8 @@ void emit_module_free(EmitModule *m) {
     free(m->relocs);
     free(m->data_relocs);
     free(m->rebases);
+    for (size_t i = 0; i < m->num_binds; i++) free(m->binds[i].name);
+    free(m->binds);
     buffer_free(&m->text);
     buffer_free(&m->rodata);
     buffer_free(&m->data);
@@ -211,6 +214,62 @@ void emit_module_add_rebase(EmitModule *m, uint64_t slot, uint64_t target) {
     m->rebases[m->num_rebases].slot = slot;
     m->rebases[m->num_rebases].target = target;
     m->num_rebases++;
+}
+
+void emit_module_add_bind(EmitModule *m, uint64_t slot, const char *name) {
+    if (!name) return;
+    if (m->num_binds >= m->cap_binds) {
+        size_t nc = m->cap_binds ? m->cap_binds * 2 : 8;
+        m->binds = realloc(m->binds, nc * sizeof(EmitBind));
+        if (!m->binds) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }
+        m->cap_binds = nc;
+    }
+    size_t nlen = strlen(name);
+    char *mach = malloc(nlen + 2);
+    if (!mach) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }
+    mach[0] = '_';
+    memcpy(mach + 1, name, nlen + 1);
+    m->binds[m->num_binds].slot = slot;
+    m->binds[m->num_binds].name = mach;
+    m->num_binds++;
+}
+
+/* Functions a freestanding image may reach for in libSystem.  Every
+ * executable already carries LC_LOAD_DYLIB for it, so dyld has the library
+ * mapped; what was missing was any way to name one of its symbols.
+ *
+ * Only what the runtime actually needs is listed.  fakecc has its own
+ * printf, malloc and string functions, so adding those would only widen
+ * the set of typos that compile.  Threads are the one thing that cannot be
+ * built from syscalls here: bsdthread_create and bsdthread_register both
+ * return EINVAL from any thread libpthread did not create, including one
+ * that already called pthread_create successfully -- measured, not assumed. */
+static const char *const emit_darwin_imports[] = {
+    "pthread_create",
+    "pthread_join",
+    "pthread_self",
+    "pthread_exit",
+    "pthread_detach",
+    "pthread_equal",
+    "pthread_once",
+    "pthread_mutex_init",
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "pthread_mutex_destroy",
+    "pthread_cond_init",
+    "pthread_cond_wait",
+    "pthread_cond_signal",
+    "pthread_cond_broadcast",
+    "pthread_cond_destroy",
+    "sched_yield",
+};
+
+int emit_is_darwin_import(const char *name) {
+    if (!name) return 0;
+    for (size_t i = 0; i < sizeof emit_darwin_imports
+                            / sizeof *emit_darwin_imports; i++)
+        if (strcmp(emit_darwin_imports[i], name) == 0) return 1;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
