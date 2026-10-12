@@ -445,9 +445,11 @@ static void emit_fp_addr(C64 *c, int rd, int off) {
 /* rd = align_down(fp + off, aln) -- an over-aligned alloca's real address.
  * AAPCS64 only guarantees a 16-byte aligned SP on entry, so a slot asking for
  * 32 or more cannot be reached by a static fp-relative offset: round the
- * address down at run time instead.  `off` is already a multiple of `aln`
- * (see the frame plan), so this lands on the same address for every access
- * and never crosses into a neighbouring slot.  aln is a power of two, so
+ * address down at run time instead.  The frame plan rounds *every* offset up
+ * to the frame's single maximum alignment, so every over-aligned slot is
+ * masked by the same amount and they keep their relative positions -- mixing
+ * per-slot alignments here would let a 64-byte slot and a 32-byte slot overlap
+ * whenever fp lands mid-way between the two.  aln is a power of two, so
  * ~(aln-1) is exactly -aln, and -32/-64 are both encodable as logical
  * immediates (a contiguous run of ones). */
 static void emit_fp_addr_aligned(C64 *c, int rd, int off, int aln) {
@@ -4338,30 +4340,50 @@ static void emit_function(C64 *c, int fi) {
     memset(c->alloca_aln, 0, (size_t)nv * sizeof(int));
     c->spill_off = NULL;
 
-    /* Pinned allocas (fp-relative, mirroring the x86 backend ordering). */
+    /* Pinned allocas (fp-relative, mirroring the x86 backend ordering).
+     *
+     * AAPCS64 only promises a 16-byte aligned SP on entry, so a slot asking
+     * for 32 or more cannot be reached by a static fp-relative offset and has
+     * to be masked at run time (see emit_fp_addr_aligned).  Every such mask
+     * must use the *same* alignment: masking a 64-byte slot down to 64 and a
+     * 32-byte slot down to 32 shifts them by different amounts, and with fp at
+     * 32 mod 64 the two then overlap by 32 bytes.  So when any slot is
+     * over-aligned, every pinned offset is rounded up to the frame's maximum
+     * alignment, which makes all the masked addresses translate by one shared
+     * delta and keeps their relative positions intact.  A 64-byte aligned
+     * slot satisfies a 32-byte request, so over-aligning the others is
+     * harmless. */
     int pinned = 0;
-    int max_aln = 8;
+    int max_aln = 16;
     for (size_t j = 0; j < fn->insts.len; j++) {
         const IRInst *s = &fn->insts.data[j];
         if (s->dst >= 0) c->def[s->dst] = (int)j;
-
+        if (s->op == IR_ALLOCA && s->alloca_bytes > 0 && s->dst >= 0) {
+            int aln = (int)s->imm >= 16 ? (int)s->imm : 8;
+            if (aln < 8) aln = 8;
+            if (aln > max_aln) max_aln = aln;
+        }
+    }
+    for (size_t j = 0; j < fn->insts.len; j++) {
+        const IRInst *s = &fn->insts.data[j];
         if (s->op == IR_ALLOCA && s->alloca_bytes > 0 && s->dst >= 0) {
             int bytes = s->alloca_bytes;
             if (bytes % 8) bytes += 8 - (bytes % 8);
             int aln = (int)s->imm >= 16 ? (int)s->imm : 8;
             if (aln < 8) aln = 8;
+            int masked = aln > 16;
+            if (masked) aln = max_aln;    /* one shared mask for the frame */
             pinned += bytes;
             if (pinned % aln) pinned += aln - (pinned % aln);
             c->alloca_off[s->dst] = -pinned;
             c->alloca_aln[s->dst] = aln;
-            if (aln > max_aln) max_aln = aln;
+            /* A masked slot resolves up to max_aln-1 bytes below the offset
+             * recorded here, so leave that much room before the next slot
+             * starts.  Without this gap the masked slot lands on top of
+             * whatever the plan placed below it. */
+            if (masked) pinned += max_aln - 1;
         }
     }
-    /* Over-aligned slots (>16) are addressed at run time as
-     * `align_down(fp + off, aln)`, which can sit up to aln-1 bytes below the
-     * slot the frame plan reserved.  Reserve that slack so the masked address
-     * never lands in the spill area below. */
-    if (max_aln > 16) pinned += max_aln - 1;
 
     /* GP spill slots, placed below the pinned area.  SIMD spills
      * follow, 16 bytes each and 16-aligned. */
