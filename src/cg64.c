@@ -65,6 +65,13 @@ typedef struct {
     int               call_area;
     int               save_total;  /* fp/lr + callee-saved saves bytes  */
     int               vararg_off;  /* fp offset of the first anonymous arg */
+    /* fp-relative slot holding the SP a dynamic alloca left behind, or -1 when
+     * the function does not allocate dynamically.  emit_call lowers SP past the
+     * outgoing area before a branch and restores it afterwards, so neither the
+     * stack arguments nor the callee's frame land on the allocated block.
+     * IR_DYN_ALLOCA rewrites the slot rather than the call site snapshotting
+     * SP: a loop can alloca more than once and SP keeps moving down. */
+    int               dyn_sp_off;
     /* GNU __builtin_apply_args / __builtin_apply blocks, fp-relative; 0 when
      * this function does not use them. */
     int               apply_args_off;
@@ -3553,6 +3560,16 @@ static void emit_call(C64 *c, const IRInst *s) {
     }
     (void)st_used;
 
+    /* AAPCS64 puts stack arguments at [sp, ...) and grows the callee's frame
+     * downwards from there, so nothing the call touches may sit above sp; an
+     * alloca() left its block exactly there.  Lowering sp by the size of the
+     * area moves both clear of the block, and offsets within the area are
+     * unchanged so the stores below need no edit.  It has to happen before
+     * those stores, which address [sp+0 ..). */
+    int swap_sp = c->dyn_sp_off != -1 && c->call_area > 0;
+    if (swap_sp)
+        a64_sub_imm12(a, A64_SP, A64_SP, (unsigned)c->call_area, 0, 1, 0);
+
     /* Stack slots first: they read homes that the GP shuffle will
      * overwrite.  The area sits at [sp+0 ..).  A 16-byte vector occupies
      * one aligned Q slot once v0–v7 are full. */
@@ -3787,6 +3804,15 @@ static void emit_call(C64 *c, const IRInst *s) {
                 a64_bl(a, c64_stub_label(c, s->call_name));
         } else
             a64_bl(a, c->fn_label[fi]);
+    }
+
+    /* Every branch above ended in a call, so this is the one place the
+     * allocating SP has to come back.  Builtins that expand inline return
+     * before here, having moved nothing. */
+    if (swap_sp) {
+        emit_fp_addr(c, SCR1, c->dyn_sp_off);
+        a64_ldr64(a, SCR0, SCR1, 0);
+        mov_sp_like(a, A64_SP, SCR0);
     }
 
     if (s->align16 == A64_MARK_HFA) {
@@ -4422,7 +4448,24 @@ static void emit_function(C64 *c, int fi) {
      * address them by. */
     c->apply_args_off = 0;
     c->apply_result_off = 0;
-    int off_acc = pinned + spill_area + fp_bytes + call_area;
+    /* Slot for the SP a dynamic alloca leaves behind, placed above call_area
+     * so the outgoing-argument writes cannot reach it. */
+    c->dyn_sp_off = -1;
+    for (size_t j = 0; j < fn->insts.len; j++)
+        if (fn->insts.data[j].op == IR_DYN_ALLOCA) { c->dyn_sp_off = 1; break; }
+
+    int off_acc = pinned + spill_area + fp_bytes;
+    if (c->dyn_sp_off > 0) {
+        /* Below everything else, and the slot's own space counted before its
+         * offset is taken.  Reusing off_acc itself would put the slot on top
+         * of the spill area: base already ends there, so -base points at the
+         * first spill byte rather than past it.  The frame's pinned slots are
+         * handed out from the same counter, so the overlap is silent.
+         * 0 is also unusable: emit_fp_addr reads it as "the address is FP". */
+        off_acc = ((off_acc + 15) & ~15) + 16;
+        c->dyn_sp_off = -off_acc;
+    }
+    off_acc += call_area;
     if (fn->needs_apply_args) {
         off_acc += APPLY_BLOCK_SIZE;
         c->apply_args_off = -off_acc;
@@ -4492,6 +4535,16 @@ static void emit_function(C64 *c, int fi) {
     }
     if (locals)
         sub_sp_bytes(a, (unsigned)locals);
+
+    /* Seed the slot with the SP the prologue just produced: a call can
+     * precede the first IR_DYN_ALLOCA (the alloca may sit in a branch that
+     * has not been taken) and the restore would otherwise load whatever
+     * happened to be in the frame there. */
+    if (c->dyn_sp_off != -1) {
+        emit_fp_addr(c, SCR0, c->dyn_sp_off);
+        mov_sp_like(a, SCR1, A64_SP);
+        a64_str64(a, SCR1, SCR0, 0);
+    }
 
     /* __builtin_apply_args hands the caller the *incoming* registers, so
      * they have to be captured here -- before the parameter homing below
@@ -5218,6 +5271,8 @@ static void emit_function(C64 *c, int fi) {
             break;
         }
         case IR_DYN_ALLOCA: {
+            /* -1 is the "no slot" sentinel; a real offset is always negative. */
+            int dyn_slot = c->dyn_sp_off != -1 ? c->dyn_sp_off : 0;
             int r = load_op(c, s->a, -1);
             if (s->b >= 0) {
                 /* alloca_with_align: alignment arrives in bits.  The ABI
@@ -5246,6 +5301,11 @@ static void emit_function(C64 *c, int fi) {
                 mov_sp_like(a, A64_SP, A64_X0);
                 int d = dst_reg(c, s->dst);
                 if (d != A64_X0) a64_mov_reg(a, d, A64_X0, 1);
+                if (dyn_slot) {
+                    emit_fp_addr(c, SCR0, dyn_slot);
+                    mov_sp_like(a, SCR1, A64_SP);
+                    a64_str64(a, SCR1, SCR0, 0);
+                }
                 commit(c, s->dst, d);
                 break;
             }
@@ -5259,6 +5319,11 @@ static void emit_function(C64 *c, int fi) {
             mov_sp_like(a, A64_SP, SCR0);
             int d = dst_reg(c, s->dst);
             a64_mov_reg(a, d, SCR0, 1);
+            if (dyn_slot) {
+                emit_fp_addr(c, SCR1, dyn_slot);
+                mov_sp_like(a, SCR0, A64_SP);
+                a64_str64(a, SCR0, SCR1, 0);
+            }
             commit(c, s->dst, d);
             break;
         }
