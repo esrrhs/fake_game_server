@@ -108,6 +108,26 @@ jobs:
           files: build/coverage.info
           fail_ci_if_error: true
 
+  # Differential fuzzing: random C programs, gcc is the oracle.  Programs in
+  # test/fuzz/known_failures are known miscompiles (reported, not failing).
+  fuzz:
+    name: random program difftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host GCC 16
+        run: bash tools/ci_install_host_gcc.sh
+
+      - name: Build
+        run: |
+          cmake -S . -B build
+          cmake --build build --parallel --target fakecc
+
+      - name: Random program difftest
+        run: bash test/fuzz/run_fuzz.sh build/fakecc 300 1
+
   # Wall-clock of this job is dominated by self-hosted e2e and difftest
   # (each run twice, -O0 then -O1).  -O0 finishes around 33 min; -O1 needs
   # the 75-minute job budget (40 min cancelled the -O1 legs).
