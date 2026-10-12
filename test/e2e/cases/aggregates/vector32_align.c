@@ -1,14 +1,5 @@
 // expect: 0
-// unsupported_on: darwin-arm64
 // vector_size(32) aligns to 32, so a leading char pads the vector to offset 32.
-//
-// The last check needs the *address* of a 32-byte-aligned local.  fakecc
-// does no dynamic stack realignment: an over-aligned local gets an offset
-// that is aligned relative to the frame pointer, but the frame pointer is
-// only 16-aligned, so the address comes out right only when the initial
-// stack happens to be 32-aligned.  Measured: the same image exits 8 eight
-// runs out of ten and 0 the other two.  The fix is realignment in the
-// prologue, not anything about this case.
 package main;
 typedef int V __attribute__((vector_size(32)));
 struct S {

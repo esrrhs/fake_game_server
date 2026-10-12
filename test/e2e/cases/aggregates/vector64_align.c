@@ -1,11 +1,5 @@
 // expect: 0
-// unsupported_on: darwin-arm64
 // vector_size(64) aligns to 64.  Passing may use ZMM or MEMORY.
-//
-// Same caveat as vector32_align: the address check needs a 64-byte-aligned
-// local, and without dynamic stack realignment that holds only when the
-// initial stack happens to be aligned that far -- the case is a coin flip
-// from run to run.
 package main;
 typedef int V __attribute__((vector_size(64)));
 struct S {

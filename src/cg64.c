@@ -56,6 +56,7 @@ typedef struct {
     const RAResult   *ra_fp;     /* SIMD homes for scalar float/double */
     int              *def;         /* SSA value -> defining inst index  */
     int              *alloca_off;  /* ALLOCA SSA id -> fp-relative off  */
+    int              *alloca_aln;  /* ALLOCA SSA id -> alignment (8..64) */
     int              *spill_off;   /* spill slot -> fp-relative offset  */
     int              *fp_spill_off; /* SIMD spill slot -> fp-relative    */
     int              *vlabels;     /* IR label id -> a64 label id       */
@@ -258,9 +259,11 @@ static int spill_off(C64 *c, IRValue v) {
 /* Forward declarations: frame/base memory accessors (defined below). */
 static void emit_load(C64 *c, int rt, int base, int width, int uns);
 static void emit_store(C64 *c, int rt, int base, int width);
-static void frame_load(C64 *c, int rt, int off, int width, int uns);
-static void frame_store(C64 *c, int valrt, int off, int width);
+static void frame_load(C64 *c, int rt, int off, int width, int uns, int aln);
+static void frame_store(C64 *c, int valrt, int off, int width, int aln);
 static void emit_fp_addr(C64 *c, int rd, int off);
+static void emit_fp_addr_aligned(C64 *c, int rd, int off, int aln);
+static int alloca_align_of(const C64 *c, IRValue slot, int nv);
 static void emit_mov_imm_w(A64Asm *a, int rd, int64_t imm, int is64);
 static void fmov_q(A64Asm *a, int rd, int rn);
 static void str_q(A64Asm *a, int rt, int rn, int byte_off);
@@ -274,7 +277,7 @@ static int dst_reg(C64 *c, IRValue v) {
 
 static void commit(C64 *c, IRValue v, int srcreg) {
     if (home_reg(c, v) >= 0) return;
-    frame_store(c, srcreg, spill_off(c, v), 8);
+    frame_store(c, srcreg, spill_off(c, v), 8, 0);
 }
 
 /* IEEE scalar float/double (value_is_float == 1, width 4 or 8).
@@ -317,8 +320,8 @@ static int fp_spill(const C64 *c, IRValue v) {
 /* v30/v31 are outside the allocatable set. */
 #define FSCR A64_V31
 
-static void fp_frame(C64 *c, int vt, int off, int is_double, int store) {
-    emit_fp_addr(c, SCR1, off);
+static void fp_frame(C64 *c, int vt, int off, int is_double, int store, int aln) {
+    emit_fp_addr_aligned(c, SCR1, off, aln);
     if (store) {
         if (is_double) a64_str_d(c->as, vt, SCR1, 0);
         else a64_str_s(c->as, vt, SCR1, 0);
@@ -334,7 +337,7 @@ static void commit_fp(C64 *c, IRValue v, int src) {
         if (h != src) a64_fmov_reg(c->as, h, src, vw(c, v) == 8);
         return;
     }
-    fp_frame(c, src, fp_spill(c, v), vw(c, v) == 8, 1);
+    fp_frame(c, src, fp_spill(c, v), vw(c, v) == 8, 1, 0);
 }
 
 /* Materialize v into a V register.  `avoid` is a V reg that must stay intact. */
@@ -350,7 +353,7 @@ static int load_fp(C64 *c, IRValue v, int avoid) {
         a64_fmov_gp(c->as, tmp, SCR0, 1, isd);
         return tmp;
     }
-    fp_frame(c, tmp, fp_spill(c, v), vw(c, v) == 8, 0);
+    fp_frame(c, tmp, fp_spill(c, v), vw(c, v) == 8, 0, 0);
     return tmp;
 }
 
@@ -406,7 +409,7 @@ static int load_op(C64 *c, IRValue v, int other) {
     }
     int r = home_reg(c, v);
     if (r >= 0) return r;
-    frame_load(c, scratch, spill_off(c, v), 8, 1);
+    frame_load(c, scratch, spill_off(c, v), 8, 1, 0);
     return scratch;
 }
 
@@ -414,7 +417,7 @@ static int load_ptrv(C64 *c, IRValue v, int other) {
     int r = home_reg(c, v);
     if (r >= 0) return r;
     int scratch = (other == SCR0) ? SCR1 : SCR0;
-    frame_load(c, scratch, spill_off(c, v), 8, 1);
+    frame_load(c, scratch, spill_off(c, v), 8, 1, 0);
     return scratch;
 }
 
@@ -439,14 +442,33 @@ static void emit_fp_addr(C64 *c, int rd, int off) {
     }
 }
 
+/* rd = align_down(fp + off, aln) -- an over-aligned alloca's real address.
+ * AAPCS64 only guarantees a 16-byte aligned SP on entry, so a slot asking for
+ * 32 or more cannot be reached by a static fp-relative offset: round the
+ * address down at run time instead.  `off` is already a multiple of `aln`
+ * (see the frame plan), so this lands on the same address for every access
+ * and never crosses into a neighbouring slot.  aln is a power of two, so
+ * ~(aln-1) is exactly -aln, and -32/-64 are both encodable as logical
+ * immediates (a contiguous run of ones). */
+static void emit_fp_addr_aligned(C64 *c, int rd, int off, int aln) {
+    emit_fp_addr(c, rd, off);
+    if (aln > 16) a64_and_imm(c->as, rd, rd, ~(uint64_t)(aln - 1), 1);
+}
+
+/* Alignment recorded for alloca `slot` (0 when it is not a pinned slot). */
+static int alloca_align_of(const C64 *c, IRValue slot, int nv) {
+    if (!c->alloca_aln || slot < 0 || slot >= nv) return 0;
+    return c->alloca_aln[slot];
+}
+
 /* fp-relative loads/stores.  LDUR/STUR cover the imm9 window.  Outside
  * it the address is built in the destination itself and then loaded
  * (`ldr rt, [rt]`): the other scratch often already holds the first
  * operand of a binary op, and reusing it as an address base drops that
  * value (seen as a wrong sum once spill slots sit below fp-256). */
-static void frame_load(C64 *c, int rt, int off, int width, int uns) {
+static void frame_load(C64 *c, int rt, int off, int width, int uns, int aln) {
     A64Asm *a = c->as;
-    if (off >= -256 && off <= 255) {
+    if (aln <= 16 && off >= -256 && off <= 255) {
         switch (width) {
         case 1:
             if (uns)
@@ -470,13 +492,13 @@ static void frame_load(C64 *c, int rt, int off, int width, int uns) {
         }
         return;
     }
-    emit_fp_addr(c, rt, off);
+    emit_fp_addr_aligned(c, rt, off, aln);
     emit_load(c, rt, rt, width, uns);
 }
 
-static void frame_store(C64 *c, int valrt, int off, int width) {
+static void frame_store(C64 *c, int valrt, int off, int width, int aln) {
     A64Asm *a = c->as;
-    if (off >= -256 && off <= 255) {
+    if (aln <= 16 && off >= -256 && off <= 255) {
         switch (width) {
         case 1: a64_stur8(a, valrt, A64_FP, off); break;
         case 2: a64_stur16(a, valrt, A64_FP, off); break;
@@ -486,7 +508,7 @@ static void frame_store(C64 *c, int valrt, int off, int width) {
         return;
     }
     int at = (valrt == SCR0) ? SCR1 : SCR0;
-    emit_fp_addr(c, at, off);
+    emit_fp_addr_aligned(c, at, off, aln);
     emit_store(c, valrt, at, width);
 }
 
@@ -2557,7 +2579,7 @@ static void place_from(C64 *c, IRValue v, int src) {
     if (v < 0) return;
     int hr = home_reg(c, v);
     if (hr < 0)
-        frame_store(c, src, spill_off(c, v), 8);
+        frame_store(c, src, spill_off(c, v), 8, 0);
     else if (hr != src)
         a64_mov_reg(c->as, hr, src, 1);
 }
@@ -2617,7 +2639,7 @@ static void emit_va(C64 *c, const IRInst *s) {
     int ap_home = home_reg(c, s->call_args[0]);
     int ap = ap_home >= 0 ? ap_home : SCR0;
     if (ap_home < 0)
-        frame_load(c, ap, spill_off(c, s->call_args[0]), 8, 1);
+        frame_load(c, ap, spill_off(c, s->call_args[0]), 8, 1, 0);
 
     if (strcmp(s->call_name, "va_start") == 0) {
         int cur = (ap == SCR1) ? A64_X0 : SCR1;
@@ -2686,7 +2708,7 @@ static void emit_va(C64 *c, const IRInst *s) {
         if (dest_home >= 0)
             a64_mov_reg(a, base, dest_home, 1);
         else if (s->call_nargs >= 2)
-            frame_load(c, base, spill_off(c, s->call_args[1]), 8, 1);
+            frame_load(c, base, spill_off(c, s->call_args[1]), 8, 1, 0);
     }
     /* nxt is free once *ap has been stored, and it is not `base`. */
     a64_mov_reg(a, nxt, base, 1);
@@ -3705,7 +3727,7 @@ static void emit_call(C64 *c, const IRInst *s) {
                 emit_mov_imm_w(a, dreg[i], d->imm, is64);
             } else {
                 int so = spill_off(c, av);
-                frame_load(c, dreg[i], so, is64 ? 8 : 4, is64 ? 1 : 0);
+                frame_load(c, dreg[i], so, is64 ? 8 : 4, is64 ? 1 : 0, 0);
             }
         }
         done[i] = 1;
@@ -3882,7 +3904,7 @@ static void emit_syscall(C64 *c, const IRInst *s) {
                 emit_mov_imm_w(c->as, A64_X0 + i, d->imm, is64);
             } else {
                 int so = spill_off(c, av);
-                frame_load(c, A64_X0 + i, so, is64 ? 8 : 4, is64 ? 1 : 0);
+                frame_load(c, A64_X0 + i, so, is64 ? 8 : 4, is64 ? 1 : 0, 0);
             }
         }
         done[i] = 1;
@@ -4312,10 +4334,13 @@ static void emit_function(C64 *c, int fi) {
     for (int i = 0; i < nv; i++) c->def[i] = -1;
     c->alloca_off = xmalloc((size_t)nv * sizeof(int));
     memset(c->alloca_off, 0, (size_t)nv * sizeof(int));
+    c->alloca_aln = xmalloc((size_t)nv * sizeof(int));
+    memset(c->alloca_aln, 0, (size_t)nv * sizeof(int));
     c->spill_off = NULL;
 
     /* Pinned allocas (fp-relative, mirroring the x86 backend ordering). */
     int pinned = 0;
+    int max_aln = 8;
     for (size_t j = 0; j < fn->insts.len; j++) {
         const IRInst *s = &fn->insts.data[j];
         if (s->dst >= 0) c->def[s->dst] = (int)j;
@@ -4328,8 +4353,15 @@ static void emit_function(C64 *c, int fi) {
             pinned += bytes;
             if (pinned % aln) pinned += aln - (pinned % aln);
             c->alloca_off[s->dst] = -pinned;
+            c->alloca_aln[s->dst] = aln;
+            if (aln > max_aln) max_aln = aln;
         }
     }
+    /* Over-aligned slots (>16) are addressed at run time as
+     * `align_down(fp + off, aln)`, which can sit up to aln-1 bytes below the
+     * slot the frame plan reserved.  Reserve that slack so the masked address
+     * never lands in the spill area below. */
+    if (max_aln > 16) pinned += max_aln - 1;
 
     /* GP spill slots, placed below the pinned area.  SIMD spills
      * follow, 16 bytes each and 16-aligned. */
@@ -4598,27 +4630,27 @@ static void emit_function(C64 *c, int fi) {
                 if (_m->dst_reg != _addr)                                    \
                     a64_mov_reg(a, _m->dst_reg, _addr, 1);                   \
             } else {                                                         \
-                frame_store(c, _addr, _m->dst_mem, 8);                       \
+                frame_store(c, _addr, _m->dst_mem, 8, 0);                       \
             }                                                                \
         } else if (_m->src_vec >= 0) {                                       \
             int _tmp = _m->dst_reg >= 0 ? _m->dst_reg : SCR1;                \
             a64_fmov_gp(a, _tmp, _m->src_vec, 0, _m->is64);                  \
             if (_m->dst_reg < 0)                                             \
-                frame_store(c, _tmp, _m->dst_mem, 8);                        \
+                frame_store(c, _tmp, _m->dst_mem, 8, 0);                        \
         } else if (_m->dst_reg >= 0) {                                       \
             if (_m->src_reg >= 0) {                                          \
                 if (_m->src_reg != _m->dst_reg)                              \
                     a64_mov_reg(a, _m->dst_reg, _m->src_reg, _m->is64);      \
             } else {                                                         \
-                frame_load(c, SCR1, _m->src_mem, 8, 1);                      \
+                frame_load(c, SCR1, _m->src_mem, 8, 1, 0);                      \
                 a64_mov_reg(a, _m->dst_reg, SCR1, _m->is64);                 \
             }                                                                \
         } else {                                                             \
             if (_m->src_reg >= 0)                                            \
                 a64_mov_reg(a, SCR1, _m->src_reg, _m->is64);                 \
             else                                                             \
-                frame_load(c, SCR1, _m->src_mem, 8, 1);                      \
-            frame_store(c, SCR1, _m->dst_mem, 8);                            \
+                frame_load(c, SCR1, _m->src_mem, 8, 1, 0);                      \
+            frame_store(c, SCR1, _m->dst_mem, 8, 0);                            \
         }                                                                    \
         _m->done = 1; remaining--;                                           \
     } while (0)
@@ -4704,7 +4736,7 @@ static void emit_function(C64 *c, int fi) {
                     emit_fp_addr(c, SCR1, m->spill);
                     str_q(a, tmp, SCR1, 0);
                 } else {
-                    fp_frame(c, tmp, m->spill, m->isd, 1);
+                    fp_frame(c, tmp, m->spill, m->isd, 1, 0);
                 }
             }
             m->done = 1;
@@ -4914,7 +4946,7 @@ static void emit_function(C64 *c, int fi) {
             /* &alloca(alloca id in a) */
             int d = dst_reg(c, s->dst);
             int off = (s->a >= 0 && s->a < nv) ? c->alloca_off[s->a] : 0;
-            emit_fp_addr(c, d, off);
+            emit_fp_addr_aligned(c, d, off, alloca_align_of(c, s->a, nv));
             commit(c, s->dst, d);
             break;
         }
@@ -5316,10 +5348,11 @@ static void emit_function(C64 *c, int fi) {
              * temps).  The unpinned SSA form (-O1) is a plain copy. */
             if (scalar_fp_val(c, s->dst)) {
                 int off = (s->a >= 0 && s->a < nv) ? c->alloca_off[s->a] : 0;
+                int saln = alloca_align_of(c, s->a, nv);
                 int h = fp_home(c, s->dst);
                 int d = h >= 0 ? h : FSCR;
                 if (off != 0) {
-                    fp_frame(c, d, off, vw(c, s->dst) == 8, 0);
+                    fp_frame(c, d, off, vw(c, s->dst) == 8, 0, saln);
                 } else {
                     int r = load_fp(c, s->a, d == FSCR ? -1 : d);
                     if (d != r) a64_fmov_reg(a, d, r, vw(c, s->dst) == 8);
@@ -5330,7 +5363,8 @@ static void emit_function(C64 *c, int fi) {
             int off = (s->a >= 0 && s->a < nv) ? c->alloca_off[s->a] : 0;
             int d = dst_reg(c, s->dst);
             if (off != 0) {
-                frame_load(c, d, off, s->width, s->is_unsigned);
+                frame_load(c, d, off, s->width, s->is_unsigned,
+                           alloca_align_of(c, s->a, nv));
             } else {
                 int ra = load_op(c, s->a, -1);
                 if (d != ra) a64_mov_reg(a, d, ra, s->width == 8);
@@ -5341,15 +5375,17 @@ static void emit_function(C64 *c, int fi) {
         case IR_STORE: {
             if (scalar_fp_val(c, s->b)) {
                 int off = (s->a >= 0 && s->a < nv) ? c->alloca_off[s->a] : 0;
+                int saln = alloca_align_of(c, s->a, nv);
                 int v = load_fp(c, s->b, -1);
-                if (off != 0) fp_frame(c, v, off, vw(c, s->b) == 8, 1);
+                if (off != 0) fp_frame(c, v, off, vw(c, s->b) == 8, 1, saln);
                 else commit_fp(c, s->a, v);
                 break;
             }
             int off = (s->a >= 0 && s->a < nv) ? c->alloca_off[s->a] : 0;
+            int saln = alloca_align_of(c, s->a, nv);
             int v = load_op(c, s->b, -1);
             if (off != 0) {
-                frame_store(c, v, off, s->width);
+                frame_store(c, v, off, s->width, saln);
             } else {
                 /* -O1 SSA form: make value a's home hold b. */
                 int d = dst_reg(c, s->a);
@@ -5465,6 +5501,7 @@ static void emit_function(C64 *c, int fi) {
 
     free(c->def);
     free(c->alloca_off);
+    free(c->alloca_aln);
     free(c->spill_off);
     free(c->fp_spill_off);
     free(c->vlabels);
