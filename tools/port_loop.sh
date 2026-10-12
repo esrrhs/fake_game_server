@@ -81,12 +81,23 @@ fi
 
 mkdir -p "$RUN_DIR"
 
+# Set when a pass fails, so the trap can keep the logs.  They are the only
+# record of what the suite actually said -- a "UNIT TESTS FAILED" with no log
+# behind it is not diagnosable, and cleaning up on the way out used to throw
+# them away exactly when they were needed.
+PASS_FAILED=0
+
 cleanup() {
     rc=$?
     rm -rf "$LOCKDIR" 2>/dev/null || true
     rm -f "$LOCK.owner" 2>/dev/null || true
-    # Keep the logs: they are what a failed pass is diagnosed from.
-    [ -n "${PORT_LOOP_KEEP:-}" ] || rm -rf "$RUN_DIR" 2>/dev/null || true
+    if [ "$rc" -ne 0 ] && [ -d "$RUN_DIR" ]; then
+        mkdir -p "${RUN_DIR}.failed" 2>/dev/null || true
+        mv "$RUN_DIR" "${RUN_DIR}.failed" 2>/dev/null || true
+        echo "pass failed; logs kept in ${RUN_DIR}.failed" >&2
+    else
+        rm -rf "$RUN_DIR" 2>/dev/null || true
+    fi
     exit $rc
 }
 trap cleanup EXIT
@@ -115,6 +126,31 @@ build() {
     log "== build"
     if ! make -C "$ROOT/build-local" -j8 >"$RUN_DIR/build.log" 2>&1; then
         tail -20 "$RUN_DIR/build.log"
+        return 1
+    fi
+    return 0
+}
+
+# A pass that starts while the tree is dirty is measuring a tree that is about
+# to change underneath it: the build here rebuilds, and anything already
+# running -- a suite started by hand, an editor's language server -- ends up
+# half-way through against binaries that were replaced.  That reads as a
+# failure in whichever stage lost the race, and cost a real investigation
+# before it was recognised for what it was.  With a per-minute trigger this
+# happens constantly, so it is checked rather than assumed.
+tree_busy() {
+    local dirty
+    dirty=$(git -C "$ROOT" status --porcelain 2>/dev/null | head -1)
+    if [ -n "$dirty" ]; then
+        log "   tree has uncommitted changes; skipping this pass"
+        log "   ($dirty)"
+        log "   commit or stash first -- a pass here would race the rebuild"
+        return 1
+    fi
+    # Someone else already inside the loop: its lock is the authority on that,
+    # and we hold it, so the only remaining source is a second tree-level job.
+    if pgrep -f "ctest|run_e2e.sh" >/dev/null 2>&1; then
+        log "   another ctest or e2e run is in flight; skipping this pass"
         return 1
     fi
     return 0
@@ -166,19 +202,29 @@ one_pass() {
     log "pass $*  -- $(date '+%H:%M:%S')"
     rule
     record_state "running $1 started=$(date '+%H:%M:%S') pid=$$"
+    if ! tree_busy; then
+        record_state "skipped-busy $(date '+%H:%M:%S')"
+        rule
+        log "pass $* skipped"
+        # Not a failure: the next trigger gets a clean run.
+        return 0
+    fi
     if ! build; then
         record_state "build-failed $(date '+%H:%M:%S')"
         log "BUILD FAILED"
+        PASS_FAILED=1
         return 2
     fi
     if ! unit_tests; then
         record_state "unit-failed $(date '+%H:%M:%S')"
         log "UNIT TESTS FAILED"
+        PASS_FAILED=1
         return 3
     fi
     if ! e2e; then
         record_state "e2e-failed $(date '+%H:%M:%S')"
         log "E2E FAILED"
+        PASS_FAILED=1
         return 4
     fi
     skip_audit
