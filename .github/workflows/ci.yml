@@ -50,6 +50,16 @@ jobs:
             cxx: g++
             cflags: ""
             cov: true
+          - label: macos-latest · clang (arm64)
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            cflags: ""
+          - label: macos-latest · clang -O2 (arm64)
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            cflags: "-O2"
 
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +67,9 @@ jobs:
       # difftest hardcodes host `gcc` as the oracle.  Runner images ship GCC
       # 13.2 (no uabs builtins; tree-optimization/123864).  Install GCC 16 so
       # the oracle matches local GCC 16.2.0 (also used when matrix.cc is gcc).
+      # macOS does not have GCC 16 available; skip this step on Darwin.
       - name: Install host GCC 16
+        if: runner.os != 'macOS'
         run: bash tools/ci_install_host_gcc.sh
 
       - name: Setup lcov
@@ -89,7 +101,14 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          ctest --test-dir build --output-on-failure
+          # Run e2e suites (macOS runs unit + e2e + multi-e2e + cli-e2e)
+          bash test/e2e/run_e2e.sh build/fakecc -O1
+          bash test/e2e/run_multi_e2e.sh build/fakecc
+          bash test/e2e/run_cli_e2e.sh build/fakecc
+          # shlib-e2e is ELF-only and skips itself on macOS
+          bash test/e2e/run_shlib_e2e.sh build/fakecc || true
 
       - name: Coverage report
         if: matrix.config.cov
