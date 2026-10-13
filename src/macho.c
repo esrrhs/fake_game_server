@@ -2041,8 +2041,24 @@ static void patch_adrp(uint32_t *w, uint64_t pc, uint64_t tgt) {
         | (uint32_t)(((pages >> 2) & 0x7FFFF) << 5);
 }
 
+/* ARM64_RELOC_PAGEOFF12 names a *byte* offset, but where that 12-bit
+ * immediate lands depends on the instruction it belongs to: add- and
+ * sub-immediate hold it whole, while a load or store with an unsigned
+ * 12-bit immediate holds it divided by the access size.  fakecc's own codegen
+ * only ever emits `add`, so it can always OR the byte offset straight in --
+ * but an object from any real toolchain writes `ldr x8, [x8]` whenever a
+ * global's address is dereferenced in place, and patching that as if it were
+ * an `add` lands up to eight times too far.  Nothing complains: the result is
+ * still a plausible address inside __data, so the program reads a zero and
+ * dereferences it. */
 static void patch_add_pageoff(uint32_t *w, uint64_t tgt) {
-    *w |= (uint32_t)(tgt & 0xFFFu) << 10;
+    uint64_t off = tgt & 0xFFFu;
+    uint32_t op = *w & 0xFF000000u;
+    if (op != 0x91000000u && op != 0xD1000000u) {
+        uint32_t scale = 1u << ((*w >> 30) & 3u);
+        if (scale > 1) off /= scale;
+    }
+    *w |= (uint32_t)(off & 0xFFFu) << 10;
 }
 
 static int patch_bl(uint32_t *w, uint64_t pc, uint64_t tgt) {
@@ -2494,7 +2510,12 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
         }
     }
 
-    typedef struct { char *name; int filled; } TlvEnt;
+    /* Keyed by where the variable ends up, not by its name.  Two translation
+     * units can each have their own `static __thread int x`, and those are
+     * two variables that happen to share a spelling -- keying on the name
+     * gives them one descriptor, one storage slot, and whichever initializer
+     * was merged first silently wins in both files. */
+    typedef struct { uint16_t sh; size_t off; int filled; } TlvEnt;
     TlvEnt *tlvs = NULL;
     size_t ntlv = 0, captlv = 0;
     size_t tlv_base = 0;
@@ -2506,16 +2527,32 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                 if (r->type != 8 || r->sym >= m->num_syms) continue;
                 const char *nm = m->syms[r->sym].name;
                 if (!nm) continue;
+                uint16_t sh = 0;
+                size_t off = 0;
+                if (adj[i][r->sym].defined && m->syms[r->sym].binding != 2) {
+                    sh = adj[i][r->sym].sh;
+                    off = adj[i][r->sym].off;
+                } else {
+                    for (size_t g = 0; g < ng; g++) {
+                        if (gdefs[g].name && strcmp(gdefs[g].name, nm) == 0) {
+                            sh = gdefs[g].sh;
+                            off = gdefs[g].off;
+                            break;
+                        }
+                    }
+                }
+                if (!sh) continue;   /* unresolved: reported with a better message below */
                 int have = 0;
                 for (size_t g = 0; g < ntlv; g++) {
-                    if (strcmp(tlvs[g].name, nm) == 0) { have = 1; break; }
+                    if (tlvs[g].sh == sh && tlvs[g].off == off) { have = 1; break; }
                 }
                 if (have) continue;
                 if (ntlv == captlv) {
                     captlv = captlv ? captlv * 2 : 4;
                     tlvs = xrealloc(tlvs, captlv * sizeof(TlvEnt));
                 }
-                tlvs[ntlv].name = xstrdup(nm);
+                tlvs[ntlv].sh = sh;
+                tlvs[ntlv].off = off;
                 tlvs[ntlv].filled = 0;
                 ntlv++;
             }
@@ -2685,7 +2722,7 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                     } else if (r->type == 8 || r->type == 9) {
                         int slot = -1;
                         for (size_t g = 0; g < ntlv; g++) {
-                            if (es->name && strcmp(tlvs[g].name, es->name) == 0) {
+                            if (tlvs[g].sh == sh && tlvs[g].off == off) {
                                 slot = (int)g;
                                 break;
                             }
@@ -2922,7 +2959,6 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
     free(gdefs);
     for (size_t g = 0; g < ngot; g++) free(gots[g].name);
     free(gots);
-    for (size_t g = 0; g < ntlv; g++) free(tlvs[g].name);
     free(tlvs);
     free(ctors);
     free(dtors);
