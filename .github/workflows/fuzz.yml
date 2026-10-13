@@ -16,6 +16,9 @@ on:
         default: '300'
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: libFuzzer · ${{ matrix.target }}
