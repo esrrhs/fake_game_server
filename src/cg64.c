@@ -6081,17 +6081,17 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
      * correct and cheaper.  Pick by which path this module will take. */
     for (size_t i = 0; i < c.nstub; i++) {
         const char *sname = c.stub[i].name;
-        int import = emit_is_darwin_import(sname)
+        int is_import = emit_is_darwin_import(sname)
                   && target_current()->os == TOS_MACOS;
         a64_bind(&a, c.stub[i].lab);
-        if (emit_object_mode() || (emit_multi_tu() && import)) {
+        if (emit_object_mode() || (emit_multi_tu() && is_import)) {
             note_page_reloc(&c, (uint32_t)a.code.len, -1, sname, -1);
             c.gfix[c.ngfix - 1].got = 1;
             a64_word(&a, 0x90000000u | (uint32_t)A64_X16);
             a64_word(&a, 0xF9400000u | ((uint32_t)A64_X16 << 5)
                                  | (uint32_t)A64_X16);
             a64_br_reg(&a, A64_X16);
-        } else if (import) {
+        } else if (is_import) {
             /* A freestanding image has no GOT, so it carries its own: one
              * 8-byte cell in __data per symbol, which dyld overwrites with
              * the address.  The cell is laid out here, before the section
