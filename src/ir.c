@@ -710,7 +710,8 @@ static int stmt_takes_addr_of(const Stmt *s, const char *name) {
 static int64_t bitfield_mask64(int bit_width) {
     if (bit_width <= 0) return 0;
     if (bit_width >= 64) return -1;
-    return (1LL << bit_width) - 1;
+    /* unsigned: 1LL << 63 would overflow the signed type. */
+    return (int64_t)((1ULL << bit_width) - 1ULL);
 }
 
 static IRValue emit_bswap_val(IRFunction *fn, IRValue v, int uw, SourceLoc loc) {
@@ -4447,6 +4448,13 @@ static IRValue lower_lvalue_addr(IRFunction *fn, IRSymTable *st, const Expr *e) 
     switch (e->kind) {
     case EX_VAR: {
         const IRSlot *entry = irsymtable_find(st, e->u.var.name);
+        if (!entry) {
+            /* Not a variable in scope: a function name used as an assignment
+             * target (`f *= 0`), which nothing has diagnosed yet.  Fail with a
+             * diagnostic instead of dereferencing NULL. */
+            return die_at(e->loc.file, e->loc.line, e->loc.col,
+                          "cannot assign to '%s'", e->u.var.name);
+        }
         if (entry->is_global) return emit_gaddr(fn, slot_global_name(entry), e->loc, entry->is_tls);
         if (entry->is_vla) {
             IRValue addr = emit_bin_w(fn, IR_ADDR, entry->slot, -1, 8, 1, e->loc);
@@ -9172,8 +9180,10 @@ static IRValue lower_expr(IRFunction *fn, IRSymTable *st, const Expr *e) {
         const char *lbl_name = e->u.label_addr.label;
         int lbl_id = g_ir_label_map ? labelmap_find(g_ir_label_map, lbl_name) : -1;
         if (lbl_id < 0) {
-            fprintf(stderr, "fakecc: &&%s: undeclared label\n", lbl_name);
-            exit(1);
+            /* A library call must not take the process down with it. */
+            die_at(e->loc.file, e->loc.line, e->loc.col,
+                   "use of undeclared label '%s'", lbl_name);
+            return -1;
         }
         IRValue dst = new_value(fn);
         /* A label address is a code pointer, not a 32-bit int.  Width 4
@@ -11562,7 +11572,8 @@ static void pack_init(const IRModule *ir, const Type *ty, const Expr *e,
                 return;
             }
             int n = sz < src->size ? sz : src->size;
-            memcpy(bytes, src->init_bytes, n);
+            if (src->init_bytes)
+                memcpy(bytes, src->init_bytes, n);
             return;
         }
     }

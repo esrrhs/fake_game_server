@@ -8,7 +8,6 @@ static void __fakecc_va_copy(void *dst, void *src){
     for(int i = 0; i < 24; i++) d[i] = s[i];
 }
 
-
 typedef long ptrdiff_t;
 typedef unsigned long size_t;
 typedef long ssize_t;
@@ -41,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 enum TokenKind {
     TK_KW_PACKAGE,
     TK_KW_IMPORT,

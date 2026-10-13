@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
@@ -219,7 +218,6 @@ void emit_link(EmitModule **mods, size_t n, const char *path,
                const char **lib_paths, size_t num_lib_paths,
                int want_debug, int is_shared);
 void emit_elf(const EmitModule *m, const char *path);
-
 void debug_emit_dwarf(const EmitModule *m, uint64_t text_base_vaddr,
                       Buffer *debug_abbrev, Buffer *debug_info,
                       Buffer *debug_str, Buffer *debug_line,

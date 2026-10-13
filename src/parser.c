@@ -48,27 +48,44 @@ typedef struct {
     ParamArray last_fn_params;
     ParserLocalArray locals;
     int scope_depth;
+    int stmt_depth;
 } Parser;
+
+/* Recursive descent has no depth limit of its own: a few hundred nested
+ * statements (`{ { { ... } } }`, `if (x) if (x) ...`) exhaust the C stack,
+ * which under ASan happens around 500 levels.  Nothing real comes close —
+ * the deepest file in the test suite nests 15 — so diagnose instead. */
+#define MAX_STMT_DEPTH 256
+
+static const Token *synthesized_eof(void) {
+    static Token eof_tok;
+    eof_tok.kind = TK_EOF;
+    eof_tok.text = "";
+    eof_tok.loc.file = "(error)";
+    eof_tok.loc.line = 0;
+    eof_tok.loc.col = 0;
+    return &eof_tok;
+}
 
 static const Token *peek(const Parser *p) {
     /* After a fatal error, synthesize EOF so parse loops terminate instead
      * of spinning on the same (possibly unconsumed) token. */
-    if (fakecc_had_error()) {
-        static Token eof_tok;
-        eof_tok.kind = TK_EOF;
-        eof_tok.text = "";
-        eof_tok.loc.file = "(error)";
-        eof_tok.loc.line = 0;
-        eof_tok.loc.col = 0;
-        return &eof_tok;
-    }
-    return &p->tokens->data[p->pos];
+    if (fakecc_had_error())
+        return synthesized_eof();
+    if (p->tokens->len == 0)
+        return synthesized_eof();
+    /* Scanners can leave p->pos past the end (an unmatched '(' for instance);
+     * report the terminating EOF token instead of reading past the array. */
+    size_t pos = p->pos < p->tokens->len ? p->pos : p->tokens->len - 1;
+    return &p->tokens->data[pos];
 }
 
 static const Token *advance(Parser *p) {
     if (fakecc_had_error())
         return peek(p);
-    return &p->tokens->data[p->pos++];
+    if (p->pos < p->tokens->len)
+        return &p->tokens->data[p->pos++];
+    return peek(p);
 }
 
 /* A token usable as a member/variable name.  Normally TK_IDENT, but fakecc
@@ -204,7 +221,7 @@ static int parse_attribute(Parser *p, int *align, int *packed, int *sso, int *ve
                     depth++;
                     Expr *e = parse_ternary(p);
                     long long val = 0;
-                    if (fold_const_int(e, &val)) {
+                    if (e && fold_const_int(e, &val)) {
                         if (val <= 0 || (val & (val - 1)) != 0) {
                             return die_at(e->loc.file, e->loc.line, e->loc.col,
                                    "requested alignment '%lld' is not a positive power of 2", val);
@@ -1423,6 +1440,8 @@ static void parse_struct_body(Parser *p, StructDef *sd) {
                 const Token *wtok = peek(p);
                 Expr *we = parse_ternary(p);
                 long long wval = 0;
+                if (!we)
+                    return;
                 if (fold_const_int(we, &wval)) {
                     bit_width = (int)wval;
                 } else if (we->kind == EX_VAR) {
@@ -1578,6 +1597,8 @@ static void parse_enum_body(Parser *p, EnumDef *ed) {
             advance(p);
             Expr *e = parse_ternary(p);
             long long val = 0;
+            if (!e)
+                return;
             if (fold_const_int(e, &val)) {
                 has_value = 1; value = (int)val;
             } else if (e->kind == EX_VAR) {
@@ -1706,6 +1727,7 @@ static long long parse_array_size_ext(Parser *p, Expr **dim_expr) {
         return -1; /* incomplete / flexible array member */
     }
     Expr *e = parse_expr(p);
+    if (!e) return FAKECC_ERR;   /* parse error, already reported */
     long long val = 0;
     if (fold_const_int(e, &val)) {
         if (val < 0) {
@@ -2478,7 +2500,8 @@ static Expr *parse_unary(Parser *p) {
         Expr *arg = parse_expr(p);
         expect_kind(p, TK_RPAREN, "')'");
         long long v;
-        int is_const = fold_const_int(arg, &v) || (arg->kind == EX_STR) || (arg->kind == EX_FLOAT_LIT);
+        int is_const = arg && (fold_const_int(arg, &v) ||
+                               arg->kind == EX_STR || arg->kind == EX_FLOAT_LIT);
         expr_free(arg);
         return expr_new_int(is_const ? 1 : 0, loc);
     }
@@ -2497,6 +2520,12 @@ static Expr *parse_unary(Parser *p) {
         expect_kind(p, TK_COMMA, "','");
         Expr *else_ = parse_assign(p);
         expect_kind(p, TK_RPAREN, "')'");
+        if (!cond || !then || !else_) {
+            expr_free(cond);
+            expr_free(then);
+            expr_free(else_);
+            return NULL;
+        }
         long long v;
         /* fold_const_int also folds float literals (truncated); those are not
          * integer constant expressions and GCC rejects them here. */
@@ -2951,14 +2980,16 @@ static int char_literal_value(const char *text) {
     if (text[1] == '\\') {
         /* Hex escape `\xHH...`: parse all consecutive hex digits. */
         if (text[2] == 'x' || text[2] == 'X') {
-            int val = 0;
+            /* unsigned: an arbitrarily long \x run must not overflow in the
+             * compiler's own signed type. */
+            unsigned val = 0;
             int i = 3;
             while (text[i] != '\0' && isxdigit((unsigned char)text[i])) {
                 char c = text[i];
                 int d = (c >= '0' && c <= '9') ? c - '0'
                       : (c >= 'a' && c <= 'f') ? c - 'a' + 10
                       : c - 'A' + 10;
-                val = val * 16 + d;
+                val = val * 16u + (unsigned)d;
                 i++;
             }
             /* lexer guarantees at least one hex digit follows `\x` */
@@ -3086,16 +3117,16 @@ static Expr *parse_primary(Parser *p) {
                 if (src[i] == '\\' && i + 1 < slen) {
                     i++;
                     if (src[i] == 'x' || src[i] == 'X') {
-                        int val = 0;
+                        unsigned val = 0;
                         while (i + 1 < slen && isxdigit((unsigned char)src[i + 1])) {
                             i++;
                             char h = src[i];
                             int d = (h >= '0' && h <= '9') ? h - '0'
                                   : (h >= 'a' && h <= 'f') ? h - 'a' + 10
                                   : h - 'A' + 10;
-                            val = val * 16 + d;
+                            val = val * 16u + (unsigned)d;
                         }
-                        ch = val;
+                        ch = (int)val;
                         i++;
                     } else if (src[i] >= '0' && src[i] <= '7') {
                         int val = src[i] - '0';
@@ -3171,14 +3202,14 @@ static Expr *parse_primary(Parser *p) {
                 if (c == '\\' && i + 1 < slen) {
                     i++;
                     if (src[i] == 'x' || src[i] == 'X') {
-                        int val = 0;
+                        unsigned val = 0;
                         while (i + 1 < slen && isxdigit((unsigned char)src[i + 1])) {
                             i++;
                             char h = src[i];
                             int d = (h >= '0' && h <= '9') ? h - '0'
                                   : (h >= 'a' && h <= 'f') ? h - 'a' + 10
                                   : h - 'A' + 10;
-                            val = val * 16 + d;
+                            val = val * 16u + (unsigned)d;
                         }
                         seg[slen2++] = (char)(val & 0xff);
                     } else if (src[i] >= '0' && src[i] <= '7') {
@@ -3473,6 +3504,15 @@ static Expr *parse_init_list(Parser *p) {
             elem = parse_assign(p);
         }
         if (end_idx >= idx) {
+            /* A designator range `[a ... b]` expands to b-a+1 elements, and
+             * `r` is an int: a bogus range asks for an allocation of
+             * astronomical size (and would wrap the loop).  Diagnose it. */
+            if (end_idx - idx > 0x100000) {
+                die_at(loc.file, loc.line, loc.col,
+                       "initializer range is too large");
+                expr_free(elem);
+                return NULL;
+            }
             for (int r = idx; r <= end_idx; r++) {
                 if (num >= cap) {
                     cap = cap ? cap * 2 : 8;
@@ -3839,7 +3879,22 @@ static Stmt parse_switch(Parser *p) {
     return s;
 }
 
+static Stmt parse_stmt_impl(Parser *p);
+
 static Stmt parse_stmt(Parser *p) {
+    if (p->stmt_depth >= MAX_STMT_DEPTH) {
+        const Token *t = peek(p);
+        die_at(t->loc.file, t->loc.line, t->loc.col,
+               "statement nesting level exceeded maximum of %d", MAX_STMT_DEPTH);
+        return (Stmt){0};
+    }
+    p->stmt_depth++;
+    Stmt s = parse_stmt_impl(p);
+    p->stmt_depth--;
+    return s;
+}
+
+static Stmt parse_stmt_impl(Parser *p) {
     if (fakecc_had_error()) return (Stmt){0};
     if (peek(p)->kind != TK_KW_TYPEDEF && !is_type_start(p, p->pos)) {
         for (;;) { if (!skip_attribute(p)) break; }
@@ -4261,6 +4316,8 @@ static Stmt parse_stmt(Parser *p) {
         } else {
             Expr *ce = parse_ternary(p);
             long long folded;
+            if (!ce)
+                return (Stmt){0};
             if (ce->kind == EX_FLOAT_LIT || !fold_const_int(ce, &folded))
                 {
                     die_at(cv->loc.file, cv->loc.line, cv->loc.col,
@@ -4281,6 +4338,8 @@ static Stmt parse_stmt(Parser *p) {
             } else {
                 Expr *he = parse_ternary(p);
                 long long folded_h;
+                if (!he)
+                    return (Stmt){0};
                 if (he->kind == EX_FLOAT_LIT || !fold_const_int(he, &folded_h))
                     {
                         die_at(hv->loc.file, hv->loc.line, hv->loc.col,
@@ -4981,7 +5040,9 @@ static FunctionDecl parse_function_decl(Parser *p) {
             /* Check if next token starts a type specifier (e.g., int, struct, typedef) */
             if (is_type_start(p, p->pos)) {
                 Type base = parse_specifiers(p);
-                Type extra_ty = parse_declarator(p, base, &extra_name);
+                /* parse_declarator() hands back `base` itself for a plain
+                 * declarator, so give it a copy: the caller frees both. */
+                Type extra_ty = parse_declarator(p, type_clone(base), &extra_name);
                 type_free(&base);
                 if (!extra_name) {
                     type_free(&extra_ty);
@@ -5309,7 +5370,7 @@ static int is_definition_only_lookahead(const Parser *p) {
     return (pos < p->tokens->len && p->tokens->data[pos].kind == TK_SEMICOLON);
 }
 
-int parse_in_pkg(const TokenArray *tokens, TranslationUnit *tu, PkgContext *ctx) {
+static int parse_in_pkg_impl(const TokenArray *tokens, TranslationUnit *tu, PkgContext *ctx) {
     fakecc_clear_error();
     Parser p;
     p.tokens = tokens;
@@ -5327,6 +5388,7 @@ int parse_in_pkg(const TokenArray *tokens, TranslationUnit *tu, PkgContext *ctx)
     p.locals.len = 0;
     p.locals.cap = 0;
     p.scope_depth = 0;
+    p.stmt_depth = 0;
 
     g_parser_tu = tu;
     /* must start with package declaration */
@@ -5501,9 +5563,18 @@ int parse_in_pkg(const TokenArray *tokens, TranslationUnit *tu, PkgContext *ctx)
     stmt_array_free(&p.prepend);
     parser_pop_scope(&p, -1);
     free(p.locals.data);
-    g_parser_tu = NULL;
     if (fakecc_had_error()) return FAKECC_ERR;
     return FAKECC_OK;
+}
+
+int parse_in_pkg(const TokenArray *tokens, TranslationUnit *tu, PkgContext *ctx) {
+    int rc = parse_in_pkg_impl(tokens, tu, ctx);
+    /* g_parser_tu points into *tu, so it must not outlive this call: the
+     * error paths above return early, and a later parse (next file of a
+     * package build, next compile in the same process) would otherwise read
+     * a TranslationUnit that no longer exists. */
+    g_parser_tu = NULL;
+    return rc;
 }
 
 int parse(const TokenArray *tokens, TranslationUnit *tu) {

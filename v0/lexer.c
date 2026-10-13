@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 enum TokenKind {
     TK_KW_PACKAGE,
     TK_KW_IMPORT,
@@ -149,7 +148,6 @@ void token_array_init(TokenArray *a);
 void token_array_free(TokenArray *a);
 void token_array_push(TokenArray *a, Token t);
 int lex(const char *source, const char *filename, TokenArray *out);
-
 typedef struct FILE FILE;
 typedef long fpos_t;
 static const char *predefined_macro_literal(const char *text, int *out_is_float) {

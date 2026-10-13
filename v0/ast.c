@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 enum TokenKind {
     TK_KW_PACKAGE,
     TK_KW_IMPORT,
@@ -622,7 +621,6 @@ struct TranslationUnit {
 };typedef struct TranslationUnit TranslationUnit;
 void tu_init(TranslationUnit *tu);
 void tu_free(TranslationUnit *tu);
-
 typedef struct FILE FILE;
 typedef long fpos_t;
 Type type_clone(Type t) {

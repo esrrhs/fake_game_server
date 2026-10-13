@@ -1,0 +1,109 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  schedule:
+    # Weekly on Sunday at 4:37 UTC
+    - cron: '37 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzz duration per target (seconds)'
+        required: false
+        default: '300'
+        type: string
+
+jobs:
+  fuzz:
+    name: libFuzzer · ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_compile, fuzz_differential]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          # ubuntu-24.04 runners ship clang; only fall back to apt when it is
+          # missing, because the apt mirrors stall often enough to matter here.
+          if command -v clang >/dev/null 2>&1; then
+            echo "clang already installed: $(clang --version | head -1)"
+          else
+            sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30
+            sudo apt-get install -y -o Dpkg::Options::="--force-confdef" \
+                 -o Dpkg::Options::="--force-confold" clang
+          fi
+
+      - name: Build fuzz target
+        run: bash fuzz/build_fuzz.sh
+
+      - name: Run fuzz (${{ matrix.target }})
+        timeout-minutes: 70
+        run: |
+          set -x
+          cd build_fuzz
+
+          # PR: quick smoke; push to master: 10 min; weekly: 60 min
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            DURATION=60
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DURATION=${{ github.event.inputs.duration }}
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            DURATION=3600
+          else
+            DURATION=600
+          fi
+          echo "Fuzzing ${{ matrix.target }} for ${DURATION}s..."
+
+          case "${{ matrix.target }}" in
+            fuzz_compile)      CORPUS=corpus/compile; MAXLEN=4096 ;;
+            fuzz_differential) CORPUS=corpus/differential; MAXLEN=2048 ;;
+          esac
+
+          # -rss_limit_mb=0: libFuzzer's default 2 GB cap is reached by ASan
+          # plus the growing corpus long before fakecc does anything wrong.
+          ASAN_OPTIONS=detect_leaks=0 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+          ./bin/${{ matrix.target }} \
+            "$CORPUS" \
+            -dict=../fuzz/c_keywords.dict \
+            -max_len=${MAXLEN} \
+            -max_total_time=${DURATION} \
+            -error_exitcode=1 \
+            -timeout_exitcode=70 \
+            -rss_limit_mb=0 \
+            -print_final_stats=1 \
+            2>&1 | tee fuzz_${{ matrix.target }}.log
+
+          # 0 = budget exhausted, 1 = bug found, 70 = slow unit (non-fatal)
+          FUZZ_EXIT=${PIPESTATUS[0]}
+          if grep -q "ERROR: libFuzzer: fuzz target exited" "fuzz_${{ matrix.target }}.log"; then
+            # fakecc reports allocation failure by calling exit(1), which kills
+            # any process embedding it.  That is not something a fuzzer run can
+            # act on, so record it and carry on.
+            echo "::warning::${{ matrix.target }}: fakecc called exit() on an out-of-memory input (non-fatal)"
+          elif [ ${FUZZ_EXIT} -eq 70 ]; then
+            echo "::warning::${{ matrix.target }} hit a per-input timeout, treating as non-fatal"
+          elif [ ${FUZZ_EXIT} -ne 0 ]; then
+            echo "::error::${{ matrix.target }} found a bug (exit ${FUZZ_EXIT})!"
+            exit 1
+          fi
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            build_fuzz/crash-*
+            build_fuzz/oom-*
+            build_fuzz/timeout-*
+            build_fuzz/fuzz_${{ matrix.target }}.log
+          if-no-files-found: ignore

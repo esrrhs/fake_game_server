@@ -97,6 +97,19 @@ void type_free(Type *t) {
 extern const StructRegistry *get_ir_structs(void);
 extern const StructRegistry *get_sema_structs(void);
 extern const StructRegistry *get_parser_structs(void);
+
+/* The struct registry to consult for layout.  Every phase publishes the
+ * TranslationUnit it is working on and unpublishes it when it is done — except
+ * ir_generate(), whose registry codegen still needs afterwards.  Ask the
+ * earliest phase that is live: a leftover IR registry points at a
+ * TranslationUnit that may already be gone (second compile in the same
+ * process, next file of a package build). */
+static const StructRegistry *current_structs(void) {
+    const StructRegistry *reg = get_parser_structs();
+    if (!reg) reg = get_sema_structs();
+    if (!reg) reg = get_ir_structs();
+    return reg;
+}
 extern const TranslationUnit *get_sema_tu(void);
 extern const TranslationUnit *get_ir_tu(void);
 
@@ -123,9 +136,7 @@ long long type_size(Type t) {
     case TY_ARRAY:  return 0;   /* array without an element type — malformed */
     case TY_STRUCT: {
         if (p->tag) {
-            const StructRegistry *reg = get_ir_structs();
-            if (!reg) reg = get_sema_structs();
-            if (!reg) reg = get_parser_structs();
+            const StructRegistry *reg = current_structs();
             if (reg) {
                 const StructDef *sd = struct_registry_find_c(reg, p->tag);
                 if (sd && sd->size > 0) return count * sd->size;
@@ -147,9 +158,7 @@ int type_is_empty_struct(Type t) {
     /* GNU empty structs and size-0 types (only a flexible/`[0]` member)
      * consume no argument slots.  gcc named args and va_arg agree. */
     if (t.kind != TY_STRUCT) return 0;
-    const StructRegistry *reg = get_ir_structs();
-    if (!reg) reg = get_sema_structs();
-    if (!reg) reg = get_parser_structs();
+    const StructRegistry *reg = current_structs();
     if (t.tag && reg) {
         const StructDef *sd = struct_registry_find_c(reg, t.tag);
         if (sd) return sd->size <= 0 || sd->num_members == 0;
@@ -476,9 +485,7 @@ long long type_align(Type t) {
     case TY_ARRAY: return 1;    /* array without an element type — malformed */
     case TY_STRUCT: {
         if (p->tag) {
-            const StructRegistry *reg = get_ir_structs();
-            if (!reg) reg = get_sema_structs();
-            if (!reg) reg = get_parser_structs();
+            const StructRegistry *reg = current_structs();
             if (reg) {
                 const StructDef *sd = struct_registry_find_c(reg, p->tag);
                 if (sd && sd->align > 0) return sd->align;
@@ -561,7 +568,7 @@ static int sysv_paint(Type t, int offset, int eight[8]) {
         return 0;
     }
     if (t.kind == TY_STRUCT && t.tag) {
-        const StructRegistry *reg = get_ir_structs();
+        const StructRegistry *reg = current_structs();
         const StructDef *sd = reg ? struct_registry_find_c(reg, t.tag) : NULL;
         if (!sd) {
             int sz = type_size(t);
@@ -683,7 +690,7 @@ int sysv_classify_agg(Type t, SysVRegClass cls[2]) {
     if (t.kind != TY_STRUCT || !t.tag) return 0;
     int sz = type_size(t);
     if (sz <= 0 || sz > 64) return 0;
-    const StructRegistry *reg = get_ir_structs();
+    const StructRegistry *reg = current_structs();
     const StructDef *sd = NULL;
     if (reg) sd = struct_registry_find_c(reg, t.tag);
     if (!sd) {
@@ -743,9 +750,7 @@ static int type_is_pure_x87(Type t) {
         return type_is_pure_x87(*t.elem_type);
     }
     if (t.kind != TY_STRUCT || !t.tag) return 0;
-    const StructRegistry *reg = get_ir_structs();
-    if (!reg) reg = get_sema_structs();
-    if (!reg) reg = get_parser_structs();
+    const StructRegistry *reg = current_structs();
     const StructDef *sd = reg ? struct_registry_find_c(reg, t.tag) : NULL;
     if (!sd) return 0;
     int any = 0;
@@ -2131,8 +2136,13 @@ int fold_const_int(const Expr *e, long long *out) {
     if (fakecc_had_error()) return FAKECC_ERR;
     if (!e) return 0;
     if (e->kind == EX_FLOAT_LIT && e->u.float_text) {
-        /* Integer conversion of a floating constant: truncate toward zero. */
-        *out = (long long)strtold(e->u.float_text, NULL);
+        /* Integer conversion of a floating constant: truncate toward zero.
+         * Out of long long range the conversion is undefined in C, so clamp
+         * instead of letting the compiler itself overflow. */
+        long double d = strtold(e->u.float_text, NULL);
+        if (d >= 9223372036854775808.0L) *out = 9223372036854775807LL;
+        else if (d < -9223372036854775807.0L - 1.0L) *out = (-9223372036854775807LL - 1);
+        else *out = (long long)d;
         return 1;
     }
     if (e->kind == EX_INT_LIT) {
@@ -2187,7 +2197,7 @@ int fold_const_int(const Expr *e, long long *out) {
         long long v;
         if (!fold_const_int(e->u.un.operand, &v)) return 0;
         switch (e->u.un.op) {
-        case UOP_NEG: *out = -v; return 1;
+        case UOP_NEG: *out = (long long)(0ull - (unsigned long long)v); return 1;
         case UOP_POS: *out = v; return 1;
         case UOP_BITNOT: *out = ~v; return 1;
         case UOP_NOT: *out = !v ? 1 : 0; return 1;
@@ -2228,35 +2238,40 @@ int fold_const_int(const Expr *e, long long *out) {
         int trunc_result = 1;
         switch (e->u.bin.op) {
         case BOP_ADD:
-            res = is_u ? (long long)(ul + ur) : l + r;
+            /* Unsigned arithmetic: the fold must not overflow in the
+             * compiler's own signed type (-fwrapv semantics, which is what the
+             * oracle runs with anyway). */
+            res = (long long)((unsigned long long)l + (unsigned long long)r);
             /* Signed ADD/SUB/MUL of constants keep the full 64-bit value so
              * parse-time folds (when e->type is still default int) do not
              * truncate `1L << 62` to 32 bits before a later subtract. */
             if (!is_u) trunc_result = 0;
             break;
         case BOP_SUB:
-            res = is_u ? (long long)(ul - ur) : l - r;
+            res = (long long)((unsigned long long)l - (unsigned long long)r);
             if (!is_u) trunc_result = 0;
             break;
         case BOP_MUL:
-            res = is_u ? (long long)(ul * ur) : l * r;
+            res = (long long)((unsigned long long)l * (unsigned long long)r);
             if (!is_u) trunc_result = 0;
             break;
         case BOP_DIV:
             if (r == 0) { *out = 0; return 1; }
-            res = is_u ? (ur ? (long long)(ul / ur) : 0) : l / r;
+            res = (long long)((unsigned long long)l / (unsigned long long)r);
             break;
         case BOP_MOD:
             if (r == 0) { *out = 0; return 1; }
-            res = is_u ? (ur ? (long long)(ul % ur) : 0) : l % r;
+            res = (long long)((unsigned long long)l % (unsigned long long)r);
             break;
         case BOP_BITAND: res = (long long)(ul & ur); break;
         case BOP_BITOR:  res = (long long)(ul | ur); break;
         case BOP_BITXOR: res = (long long)(ul ^ ur); break;
-        case BOP_SHL:    res = is_u ? (long long)(ul << (r & 63)) : (l << r); break;
+        case BOP_SHL:
+            res = (long long)((unsigned long long)l << (r & 63));
+            break;
         case BOP_SHR:
             if (is_u) res = (long long)(ul >> (r & 63));
-            else res = l >> r;
+            else res = l >> (r & 63);
             break;
         case BOP_EQ:     res = is_u ? (ul == ur) : (l == r); break;
         case BOP_NE:     res = is_u ? (ul != ur) : (l != r); break;

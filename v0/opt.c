@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
@@ -959,7 +958,7 @@ struct RAResult {
 RAResult *reg_alloc(const IRFunction *fn);
 RAResult *reg_alloc_xmm(const IRFunction *fn);
 void ra_result_free(RAResult *ra);
-
+void ra_set_reserve_va_scratch(int on);
 typedef struct FILE FILE;
 typedef long fpos_t;
 static void pin_scalar_allocas(IRFunction *fn) {
@@ -1034,6 +1033,7 @@ static void reinsert_markers(IRFunction *fn, ExtractedMarker *markers, int nmark
     fn->insts = out;
 }
 void opt(IRModule *ir, int opt_level, int want_debug) {
+    ra_set_reserve_va_scratch(opt_level > 0);
     for (size_t i = 0; i < ir->functions.len; i++) {
         IRFunction *fn = &ir->functions.data[i];
         if (opt_level == 0)
@@ -1056,4 +1056,5 @@ void opt(IRModule *ir, int opt_level, int want_debug) {
             fn->ra_xmm = reg_alloc_xmm(fn);
         }
     }
+    ra_set_reserve_va_scratch(0);
 }

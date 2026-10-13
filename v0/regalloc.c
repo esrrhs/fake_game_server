@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
@@ -886,6 +885,7 @@ struct RAResult {
 RAResult *reg_alloc(const IRFunction *fn);
 RAResult *reg_alloc_xmm(const IRFunction *fn);
 void ra_result_free(RAResult *ra);
+void ra_set_reserve_va_scratch(int on);
 struct CFGBlock {
     int id;
     int label;
@@ -913,10 +913,24 @@ struct RegClass {
     int nregs;
     unsigned caller_saved;
 };typedef struct RegClass RegClass;
+static int ra_reserve_va_scratch = 0;
+void ra_set_reserve_va_scratch(int on) {
+    ra_reserve_va_scratch = on ? 1 : 0;
+}
 static const RegClass GP_CLASS = {
     .regs = ALLOCATABLE_REGS,
     .nregs = 9,
     .caller_saved = 0x3Fu,
+};
+static const int GP_NO_R11_REGS[] = {
+    REG_RSI, REG_RDI,
+    REG_R8, REG_R9, REG_R10,
+    REG_RBX, REG_R12, REG_R13
+};
+static const RegClass GP_CLASS_NO_R11 = {
+    .regs = GP_NO_R11_REGS,
+    .nregs = 8,
+    .caller_saved = 0x1Fu,
 };
 static const RegClass XMM_CLASS = {
     .regs = XMM_ALLOCATABLE_REGS,
@@ -1326,6 +1340,23 @@ static void build_interf_graph_cfg(const IRFunction *fn, const CFG *cfg,
             }
         }
     }
+    if (ra_reserve_va_scratch) {
+        int changed = 1;
+        while (changed) {
+            changed = 0;
+            for (size_t i = 0; i < fn->insts.len; i++) {
+                const IRInst *inst = &fn->insts.data[i];
+                if (inst->op != IR_COPY) continue;
+                int d = inst->dst, a = inst->a;
+                if (d < 0 || d >= nv || a < 0 || a >= nv) continue;
+                if (!value_in_class(fn, d, float_class)) continue;
+                if (!value_in_class(fn, a, float_class)) continue;
+                int m = forbid_mask[d] | forbid_mask[a];
+                if (forbid_mask[d] != m) { forbid_mask[d] = m; changed = 1; }
+                if (forbid_mask[a] != m) { forbid_mask[a] = m; changed = 1; }
+            }
+        }
+    }
     for (size_t bi = 0; bi < cfg->num; bi++) {
         const CFGBlock *blk = &cfg->blocks[bi];
         bs_copy(&live, &out_b[bi]);
@@ -1599,7 +1630,8 @@ static RAResult *ra_alloc_class(const IRFunction *fn, int float_class,
     return ra;
 }
 RAResult *reg_alloc(const IRFunction *fn) {
-    return ra_alloc_class(fn, 0, &GP_CLASS);
+    return ra_alloc_class(fn, 0,
+                          ra_reserve_va_scratch ? &GP_CLASS_NO_R11 : &GP_CLASS);
 }
 RAResult *reg_alloc_xmm(const IRFunction *fn) {
     return ra_alloc_class(fn, 1, &XMM_CLASS);

@@ -648,9 +648,12 @@ static int type_rank(Type t) {
 }
 
 /* Integer promotion (C §6.3.1.6): types narrower than int → int.
- * Float types are NOT integer-promoted — they keep their type. */
+ * Float types are NOT integer-promoted — they keep their type.
+ * Returns an owned copy: callers release their input right after, so handing
+ * back the argument itself would leave the result pointing at freed memory
+ * (the same rule usual_arith_conv() follows). */
 static Type integer_promote(Type t) {
-    if (t.kind == TY_FLOAT) return t;
+    if (t.kind == TY_FLOAT) return type_clone(t);
     /* C §6.3.1.1: a bit-field promotes to signed int if every value of the field fits in int. */
     if (t.bitfield_width > 0) {
         if (!t.is_unsigned) {
@@ -670,7 +673,7 @@ static Type integer_promote(Type t) {
         }
     }
     if (t.width < 4) return type_make_int(4, 0);
-    return t;
+    return type_clone(t);
 }
 
 /* Usual arithmetic conversions (C §6.3.1.8).
@@ -867,6 +870,18 @@ static void ftab_cur_free(void) { ftab_free(&g_sema_ft); }
 static const FunSig *ftab_lookup(const char *name) {
     return ftab_find(&g_sema_ft, name);
 }
+/* Copy a FunSig out of the table.  Callers keep the returned value across
+ * recursive check_expr_inner() calls, which can push new package exports and
+ * realloc the table -- a raw &t->data[i] would dangle by the time it is read
+ * back.  The nested param_types array is shared, not cloned: those Type
+ * objects live until ftab_free, and the snapshot is only read. */
+static int ftab_snapshot(const char *name, FunSig *out) {
+    const FunSig *sig = ftab_find(&g_sema_ft, name);
+    if (!sig) return 0;
+    *out = *sig;
+    return 1;
+}
+
 static void ftab_add(const FunctionDecl *fn) { ftab_push(&g_sema_ft, fn); }
 static void ftab_add_export(const PkgFuncExport *ex) {
     ftab_push_export(&g_sema_ft, ex);
@@ -1869,6 +1884,49 @@ static Type check_expr_inner(Expr *e) {
             set_type(e, t0);
             return type_clone(e->type);
         }
+        /* The float classification builtins are expanded inline too (ir.c reads
+         * their arguments positionally), so check the count here rather than
+         * let the lowering index past the end of the argument array.  The
+         * names are matched exactly, the way ir.c dispatches on them: a
+         * program that defines its own isunordered() keeps working. */
+        if (e->u.call.callee->kind == EX_VAR) {
+            static const char *const one_arg[] = {
+                "__builtin_isnan", "__builtin_isnanf", "__builtin_isnanl", "isnan",
+                "__builtin_isinf", "__builtin_isinff", "__builtin_isinfl", "isinf",
+                "__builtin_isfinite", "__builtin_isfinitef", "__builtin_isfinitel",
+                "isfinite", NULL };
+            static const char *const two_arg[] = {
+                "__builtin_isgreater", "__builtin_isgreaterequal",
+                "__builtin_isless", "__builtin_islessequal",
+                "__builtin_islessgreater", "__builtin_isunordered", NULL };
+            const char *bn = e->u.call.callee->u.var.name;
+            for (int k = 0; one_arg[k]; k++)
+                if (strcmp(bn, one_arg[k]) == 0 && e->u.call.args.len != 1) {
+                    die_at(e->loc.file, e->loc.line, e->loc.col,
+                           "'%s' takes exactly 1 argument", bn);
+                    return type_make_void();
+                }
+            for (int k = 0; two_arg[k]; k++)
+                if (strcmp(bn, two_arg[k]) == 0 && e->u.call.args.len != 2) {
+                    die_at(e->loc.file, e->loc.line, e->loc.col,
+                           "'%s' takes exactly 2 arguments", bn);
+                    return type_make_void();
+                }
+        }
+        /* GCC integer bit builtins — codegen expands these inline (lzcnt /
+         * tzcnt / popcnt / bswap) and reads their single argument directly, so
+         * the argument count has to be right before we get there. */
+        if (e->u.call.callee->kind == EX_VAR) {
+            const char *bn = e->u.call.callee->u.var.name;
+            if (strncmp(bn, "__builtin_", 10) == 0 && e->u.call.args.len != 1
+                && (strstr(bn, "clz") || strstr(bn, "ctz") || strstr(bn, "ffs")
+                    || strstr(bn, "popcount") || strstr(bn, "parity")
+                    || strstr(bn, "clrsb") || strstr(bn, "bswap"))) {
+                die_at(e->loc.file, e->loc.line, e->loc.col,
+                       "'%s' takes exactly 1 argument", bn);
+                return type_make_void();
+            }
+        }
         /* __builtin_ctzll(x) — count trailing zeros of a nonzero uint64.  The
          * surrounding code guarantees the argument is nonzero (`_w &&`), so
          * the result is well-defined (1..64).  Returns int. */
@@ -2280,7 +2338,10 @@ static Type check_expr_inner(Expr *e) {
                                  && local_fn_sym->type.pointee
                                  && local_fn_sym->type.pointee->kind == TY_FUNC;
             int have_local = local_is_fnptr || (local_is_fn_decl && !local_fn_sym->type.func_is_unprototyped);
-            const FunSig *sig = have_local ? NULL : ftab_lookup(e->u.call.callee->u.var.name);
+            FunSig sig_snapshot;
+            const FunSig *sig = (have_local ||
+                                 !ftab_snapshot(e->u.call.callee->u.var.name, &sig_snapshot))
+                                ? NULL : &sig_snapshot;
             if (local_fn_sym && local_fn_sym->type.kind == TY_FUNC
                 && !(local_fn_sym->type.func_is_unprototyped && sig && !sig->is_unprototyped)) {
                 const Type *fty = &local_fn_sym->type;
@@ -3106,9 +3167,15 @@ static void normalize_init_list(Type *target, Expr *list, SourceLoc loc, int is_
      * zeros are the object's background (emit_zero_bytes / pack_init calloc).
      * Structs still materialize a 0 per member: N is small and overlay /
      * pack_init index members by position. */
+    /* An incomplete or flexible array has length -1; there is no dense array
+     * to build (and calloc((size_t)-1, ...) would overflow). */
+    if (N < 0) {
+        die_at(loc.file, loc.line, loc.col,
+               "initialization of an incomplete array");
+        return;
+    }
     Expr **out = calloc((size_t)N, sizeof(Expr *));
-    if (!out) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }
-    if (target->kind != TY_ARRAY && !target->is_vector) {
+    if (!out) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }    if (target->kind != TY_ARRAY && !target->is_vector) {
         for (int i = 0; i < N; i++)
             out[i] = expr_new_int(0, loc);
     }
@@ -3256,7 +3323,8 @@ static void normalize_init_list(Type *target, Expr *list, SourceLoc loc, int is_
     if (keep_union_desig) {
         if (last_union_member_idx < 0 || last_union_member_idx >= sd->num_members)
             last_union_member_idx = 0;
-        const char *mn = sd->members[last_union_member_idx].name;
+        const char *mn = sd->num_members > 0
+            ? sd->members[last_union_member_idx].name : NULL;
         if (mn && mn[0]) {
             union_member_name = xstrdup(mn);
             union_desig_kind = 1;
@@ -3644,8 +3712,8 @@ static void check_stmt(Stmt *s, size_t scope_mark, int *has_return) {
     }
 }
 
-int sema_check_in_pkg(const TranslationUnit *tu_const, int require_main,
-                       PkgContext *ctx) {
+static int sema_check_in_pkg_impl(const TranslationUnit *tu_const, int require_main,
+                                  PkgContext *ctx) {
     fakecc_clear_error();
     g_sema_error_count = 0;
     TranslationUnit *tu = (TranslationUnit *)tu_const;
@@ -3951,11 +4019,20 @@ int sema_check_in_pkg(const TranslationUnit *tu_const, int require_main,
 
     ftab_cur_free();
     symtable_free(&globals);
+    if (fakecc_had_error() || g_sema_error_count > 0) return FAKECC_ERR;
+    return FAKECC_OK;
+}
+
+int sema_check_in_pkg(const TranslationUnit *tu_const, int require_main,
+                       PkgContext *ctx) {
+    int rc = sema_check_in_pkg_impl(tu_const, require_main, ctx);
+    /* g_sema_structs/g_sema_tu point into *tu_const: drop them on the error
+     * paths too (they return early), so a later compile in the same process
+     * cannot consult a TranslationUnit that has gone away. */
     g_sema_pkg = NULL;
     g_sema_tu = NULL;
     g_sema_structs = NULL;
-    if (fakecc_had_error() || g_sema_error_count > 0) return FAKECC_ERR;
-    return FAKECC_OK;
+    return rc;
 }
 
 int sema_check(const TranslationUnit *tu, int require_main) {

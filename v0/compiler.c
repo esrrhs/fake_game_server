@@ -74,7 +74,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 enum TokenKind {
     TK_KW_PACKAGE,
     TK_KW_IMPORT,
@@ -1128,7 +1127,6 @@ int sema_error_count(void);
 int sema_warning_count(void);
 typedef struct FILE FILE;
 typedef long fpos_t;
-
 static int file_readable(const char *path) {
     FILE *f = runtime.fopen(path, "rb");
     if (!f) return 0;

@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 enum TokenKind {
     TK_KW_PACKAGE,
     TK_KW_IMPORT,
@@ -622,7 +621,6 @@ struct TranslationUnit {
 };typedef struct TranslationUnit TranslationUnit;
 void tu_init(TranslationUnit *tu);
 void tu_free(TranslationUnit *tu);
-
 struct PkgContext;
 int sema_check(const TranslationUnit *tu, int require_main);
 int sema_check_in_pkg(const TranslationUnit *tu, int require_main,
@@ -1321,6 +1319,12 @@ static void ftab_cur_init(void) { ftab_init(&g_sema_ft); }
 static void ftab_cur_free(void) { ftab_free(&g_sema_ft); }
 static const FunSig *ftab_lookup(const char *name) {
     return ftab_find(&g_sema_ft, name);
+}
+static int ftab_snapshot(const char *name, FunSig *out) {
+    const FunSig *sig = ftab_find(&g_sema_ft, name);
+    if (!sig) return 0;
+    *out = *sig;
+    return 1;
 }
 static void ftab_add(const FunctionDecl *fn) { ftab_push(&g_sema_ft, fn); }
 static void ftab_add_export(const PkgFuncExport *ex) {
@@ -2299,7 +2303,10 @@ Type p1;
                                  && local_fn_sym->type.pointee
                                  && local_fn_sym->type.pointee->kind == TY_FUNC;
             int have_local = local_is_fnptr || (local_is_fn_decl && !local_fn_sym->type.func_is_unprototyped);
-            const FunSig *sig = have_local ? ((void*)0) : ftab_lookup(e->u.call.callee->u.var.name);
+            FunSig sig_snapshot;
+            const FunSig *sig = (have_local ||
+                                 !ftab_snapshot(e->u.call.callee->u.var.name, &sig_snapshot))
+                                ? ((void*)0) : &sig_snapshot;
             if (local_fn_sym && local_fn_sym->type.kind == TY_FUNC
                 && !(local_fn_sym->type.func_is_unprototyped && sig && !sig->is_unprototyped)) {
                 const Type *fty = &local_fn_sym->type;

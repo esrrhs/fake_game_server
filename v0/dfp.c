@@ -24,7 +24,6 @@ int dfp_from_int(unsigned long long val, unsigned long long val_hi,
 int dfp_convert_width(int src_w, unsigned long long slo, unsigned long long shi,
                       int dst_w, unsigned long long *dlo, unsigned long long *dhi);
 enum { DFP_ADD = 0, DFP_SUB = 1, DFP_MUL = 2, DFP_DIV = 3 };
-
 enum { DFP_FINITE = 0, DFP_INF = 1, DFP_NAN = 2 };
 struct Dfp {
     int cls;

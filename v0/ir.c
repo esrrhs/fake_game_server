@@ -40,7 +40,6 @@ int fakecc_had_error(void);
 int fakecc_error_code(void);
 const char *fakecc_error_message(void);
 SourceLoc fakecc_error_loc(void);
-
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
@@ -864,7 +863,6 @@ int dfp_from_int(unsigned long long val, unsigned long long val_hi,
 int dfp_convert_width(int src_w, unsigned long long slo, unsigned long long shi,
                       int dst_w, unsigned long long *dlo, unsigned long long *dhi);
 enum { DFP_ADD = 0, DFP_SUB = 1, DFP_MUL = 2, DFP_DIV = 3 };
-
 typedef struct FILE FILE;
 typedef long fpos_t;
 IRModule *g_ir_module = ((void*)0);
