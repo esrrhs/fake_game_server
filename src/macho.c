@@ -1959,11 +1959,12 @@ int macho_read_object(const char *path, EmitModule *em) {
                  * An *external* one is a real thread-local whose descriptor we
                  * failed to make sense of, and that is worth an error. */
                 if (d->binding != 0) {
+                    const char *sym_name = d->name[0] ? d->name : "?";
                     free(buf); free(defs); free(tvar_target);
                     emit_module_free(em);
                     fprintf(stderr, "fakecc: '%s' thread-local symbol '%s' has "
                             "no usable initializer in its descriptor\n", path,
-                            d->name[0] ? d->name : "?");
+                            sym_name);
                     return -1;
                 }
                 value = desc_off;
