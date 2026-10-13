@@ -106,12 +106,13 @@ jobs:
       - name: Test
         run: |
           ctest --test-dir build --output-on-failure
-          # Run e2e suites (macOS runs unit + e2e + multi-e2e + cli-e2e)
-          bash test/e2e/run_e2e.sh build/fakecc -O1
-          bash test/e2e/run_multi_e2e.sh build/fakecc
-          bash test/e2e/run_cli_e2e.sh build/fakecc
-          # shlib-e2e is ELF-only and skips itself on macOS
-          bash test/e2e/run_shlib_e2e.sh build/fakecc || true
+          # On macOS, also run the e2e suites (Linux runs them in bootstrap-suite jobs)
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            bash test/e2e/run_e2e.sh build/fakecc -O1
+            bash test/e2e/run_multi_e2e.sh build/fakecc
+            bash test/e2e/run_cli_e2e.sh build/fakecc
+            bash test/e2e/run_shlib_e2e.sh build/fakecc || true
+          fi
 
       - name: Coverage report
         if: matrix.config.cov
