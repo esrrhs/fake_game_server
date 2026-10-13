@@ -1048,6 +1048,17 @@ void emit_link(EmitModule **mods, size_t n, const char *path,
     /* Linker dispatch: the arm64-macos backend emits an ad-hoc signed
      * Mach-O PIE; everything below is the ELF executable/DSO linker. */
     if (target_current()->objfmt == TARGET_OBJFMT_MACHO) {
+        /* -shared on Mach-O is refused in main(), before anything is
+         * compiled, so that the diagnostic names the real reason instead of
+         * surfacing as "no 'main' function found" from whichever stage
+         * happened to look first.  This is the backstop for any caller that
+         * reaches the linker directly rather than through the driver. */
+        if (is_shared) {
+            fprintf(stderr,
+                    "fakecc: -shared is not implemented for the "
+                    "arm64-macos target\n");
+            exit(1);
+        }
         /* The direct-write fast path packs exactly one module and has no room
          * to relocate anything, so it is only valid for a lone freestanding
          * TU whose text already starts with the LC_MAIN stub.  Modules that

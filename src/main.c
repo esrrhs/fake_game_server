@@ -599,6 +599,24 @@ int main(int argc, char **argv) {
         && !arm64_link_runtime)
         nlinked_files = 0;
 
+    /* -shared means something different on Mach-O, and this backend cannot
+     * build it: a dylib is MH_DYLIB with an LC_ID_DYLIB and no entry stub,
+     * its exports reach dyld through an LC_DYLD_INFO export trie, and --
+     * the part that decides whether it is worth building at all -- nothing
+     * could consume the result: the Mach-O link path has no -l, and the
+     * runtime exposes no dlopen.  Refused here, before any compilation,
+     * because otherwise the message the user sees is "no 'main' function
+     * found", which sends them looking for a main function that was never
+     * the problem. */
+    if (is_shared && target_current()->objfmt == TARGET_OBJFMT_MACHO
+        && !compile_only) {
+        fprintf(stderr,
+                "fakecc: -shared is not implemented for the arm64-macos "
+                "target: it needs an MH_DYLIB with LC_ID_DYLIB and an export "
+                "trie, and there is no -l or dlopen here to consume it\n");
+        exit(1);
+    }
+
     int nmods = ninputs + nlinked_files;
     /* A TU that defines no main is legal as soon as more than one module
      * contributes to the link -- the arm64 backend emits its entry stub in

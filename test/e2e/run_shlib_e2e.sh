@@ -25,6 +25,19 @@ trap 'rm -rf "$TMP"' EXIT
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*"; FAIL=1; }
 
+# Everything below is ELF dynamic linking: -soname, DT_NEEDED, DT_RUNPATH,
+# -l:, and .so paths.  None of them exist on Mach-O, where the equivalents are
+# -install_name, LC_LOAD_DYLIB, LC_RPATH, and .dylib -- and the underlying
+# capability is missing too, since -shared is refused for arm64-macos.  Skip
+# as a whole rather than failing on the first `gcc -Wl,-soname`, so the
+# suite's status stays legible next to the other three.
+HOST_OS=$(uname -s | tr 'A-Z' 'a-z')
+if [ "$HOST_OS" != "linux" ]; then
+    echo "SKIP shared-library suite is ELF-only (host $HOST_OS); Mach-O uses"
+    echo "SKIP -install_name / LC_LOAD_DYLIB / LC_RPATH / .dylib instead"
+    exit 0
+fi
+
 # Locale-independent dynamic-tag helpers (has_needed / has_runpath) come from
 # the sourced compat.sh, which prefers readelf and falls back to otool.
 
