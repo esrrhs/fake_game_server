@@ -1546,6 +1546,7 @@ int macho_read_object(const char *path, EmitModule *em) {
         uint16_t shndx;
         int      meta;   /* link-time metadata: bytes kept, relocations not */
         int      known_unsupported;
+        int      no_prio; /* constructor list without a priority field */
     } RSec;
     RSec secs[16];
     int nsec = 0;
@@ -1648,10 +1649,13 @@ int macho_read_object(const char *path, EmitModule *em) {
                  * __init_array, under the name the ELF-shaped toolchain uses,
                  * and what a stock clang .o carries for __attribute__
                  * ((constructor)) and friends. */
-                else if (sect_is(rs->sect, "__mod_init_func"))
+                else if (sect_is(rs->sect, "__mod_init_func")) {
                     rs->shndx = SECT_INIT_ARRAY;
-                else if (sect_is(rs->sect, "__mod_term_func"))
+                    rs->no_prio = 1;
+                } else if (sect_is(rs->sect, "__mod_term_func")) {
                     rs->shndx = SECT_FINI_ARRAY;
+                    rs->no_prio = 1;
+                }
                 else if (sect_is(rs->sect, "__init_array"))
                     rs->shndx = SECT_INIT_ARRAY;
                 else if (sect_is(rs->sect, "__fini_array"))
@@ -1732,11 +1736,20 @@ int macho_read_object(const char *path, EmitModule *em) {
             int **prio = fini ? &em->fini_prio : &em->init_prio;
             const unsigned char *bytes = buf + rs->offset;
             size_t base = arr->len / 8;
-            size_t nslot = (size_t)rs->size / 16;
+            /* Two shapes for the same list.  .init_array holds {pointer,
+             * priority} pairs, which is what fakecc writes and what makes an
+             * out-of-order list possible at all.  The ELF-shaped name clang
+             * uses, __mod_init_func, holds bare pointers already sorted, and
+             * reading it with a 16-byte stride swallows two entries per slot
+             * and takes the second entry's pointer as a priority -- so half
+             * the constructors never run, and the ones that do sort by
+             * whatever that pointer happens to be. */
+            size_t stride = rs->no_prio ? 8 : 16;
+            size_t nslot = (size_t)rs->size / stride;
             for (size_t s = 0; s < nslot; s++) {
-                buffer_append(arr, (const char *)bytes + s * 16, 8);
-                int64_t pv = 0;
-                memcpy(&pv, bytes + s * 16 + 8, 8);
+                buffer_append(arr, (const char *)bytes + s * stride, 8);
+                int64_t pv = INIT_PRIO_DEFAULT;
+                if (!rs->no_prio) memcpy(&pv, bytes + s * 16 + 8, 8);
                 *prio = realloc(*prio, (base + s + 1) * sizeof(int));
                 if (!*prio) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }
                 (*prio)[base + s] = (int)pv;
@@ -2015,7 +2028,12 @@ int macho_read_object(const char *path, EmitModule *em) {
                 have_pending = 0;
             }
             if (rs->shndx == SECT_INIT_ARRAY || rs->shndx == SECT_FINI_ARRAY) {
-                size_t slot = ((size_t)addr / 16) * 8;
+                /* Same two shapes as above: with no priority field the
+                 * entries are 8 bytes apart, and dividing by 16 folds every
+                 * second one onto the first, so only one constructor is ever
+                 * registered. */
+                size_t slot = rs->no_prio ? (size_t)addr
+                                         : ((size_t)addr / 16) * 8;
                 emit_module_add_data_reloc(em, slot, type, (int)sym, 0);
                 em->data_relocs[em->num_data_relocs - 1].shndx = rs->shndx;
             } else if (rs->shndx == SECT_DATA || rs->shndx == SECT_TDATA) {
@@ -2113,7 +2131,7 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
     EmitModule out;
     emit_module_init(&out);
 
-    typedef struct { int prio; size_t mod; uint32_t sym; } HookRef;
+    typedef struct { int prio; size_t mod; size_t slot; uint32_t sym; } HookRef;
     HookRef *ctors = NULL, *dtors = NULL;
     size_t nctors = 0, ndtors = 0, capc = 0, capd = 0;
     for (size_t i = 0; i < n; i++) {
@@ -2137,9 +2155,28 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
             }
             (*arr)[*cnt].prio = prio;
             (*arr)[*cnt].mod = i;
+            (*arr)[*cnt].slot = slot;
             (*arr)[*cnt].sym = r->sym;
             (*cnt)++;
         }
+    }
+    /* Restore list order before applying priorities.  A relocation list is
+     * stored in descending address order, so collecting it in order reverses
+     * every constructor list -- harmless when the priorities differ, fatal
+     * when they do not, which is the normal case for a list that came from a
+     * toolchain that pre-sorts it.  Insertion sort on (module, slot) is
+     * stable, so two hooks with the same priority keep the order the section
+     * gave them. */
+    for (size_t i = 1; i < nctors; i++) {
+        HookRef key = ctors[i];
+        size_t j = i;
+        while (j > 0 && (ctors[j - 1].mod > key.mod
+                      || (ctors[j - 1].mod == key.mod
+                          && ctors[j - 1].slot > key.slot))) {
+            ctors[j] = ctors[j - 1];
+            j--;
+        }
+        ctors[j] = key;
     }
     for (size_t i = 1; i < nctors; i++) {
         HookRef key = ctors[i];
@@ -2149,6 +2186,17 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
             j--;
         }
         ctors[j] = key;
+    }
+    for (size_t i = 1; i < ndtors; i++) {
+        HookRef key = dtors[i];
+        size_t j = i;
+        while (j > 0 && (dtors[j - 1].mod > key.mod
+                      || (dtors[j - 1].mod == key.mod
+                          && dtors[j - 1].slot > key.slot))) {
+            dtors[j] = dtors[j - 1];
+            j--;
+        }
+        dtors[j] = key;
     }
     for (size_t i = 1; i < ndtors; i++) {
         HookRef key = dtors[i];

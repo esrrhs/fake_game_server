@@ -577,10 +577,17 @@ static int sysv_paint(Type t, int offset, int eight[8]) {
             const StructMember *m = &sd->members[mi];
             /* Zero-width `: 0` only forces alignment; it is not an ABI object. */
             if (m->bit_width == 0) continue;
-            /* GNU union with a true FAM (`char d[]`, length < 0) is MEMORY.
-             * `[0]` is not a FAM and does not force this. */
+            /* A union carrying a true flexible array member is passed in
+             * memory -- but only under SysV/x86-64, which is where that rule
+             * comes from.  AAPCS64 has no such clause: clang hands
+             * `union U { int n; char d[]; }` to a callee in a general
+             * register, and a fixed 4-byte union classifies like any other
+             * small aggregate.  Applying the SysV rule on arm64 puts the
+             * argument on the stack where the callee is not looking, and the
+             * callee reads whatever the register happened to hold. */
             if (sd->is_union && m->type.kind == TY_ARRAY && m->type.length < 0
-                && !m->type.vla_dim)
+                && !m->type.vla_dim
+                && target_current()->arch != TARGET_ARCH_ARM64)
                 return 1;
             int moff = offset + m->offset;
             int msz = m->bit_width > 0 ? 0 : type_size(m->type);
