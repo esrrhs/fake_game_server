@@ -104,15 +104,7 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Test
-        run: |
-          ctest --test-dir build --output-on-failure
-          # On macOS, also run the e2e suites (Linux runs them in bootstrap-suite jobs)
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            bash test/e2e/run_e2e.sh build/fakecc -O1
-            bash test/e2e/run_multi_e2e.sh build/fakecc
-            bash test/e2e/run_cli_e2e.sh build/fakecc
-            bash test/e2e/run_shlib_e2e.sh build/fakecc || true
-          fi
+        run: ctest --test-dir build --output-on-failure
 
       - name: Coverage report
         if: matrix.config.cov
@@ -271,5 +263,47 @@ jobs:
             *)
               echo "unknown suite: $SUITE" >&2
               exit 2
+              ;;
+          esac
+
+  # macOS e2e suites: same coverage as Linux bootstrap-suite, but using the
+  # host-built compiler (bootstrap on arm64 hits a conditional-branch-range
+  # limitation that is being investigated separately).
+  macos-suite:
+    name: macos · ${{ matrix.label }}
+    runs-on: macos-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: e2e -O0
+            opt: -O0
+          - label: e2e -O1
+            opt: -O1
+          - label: multi/cli/compile/ports
+            opt: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build
+          cmake --build build --parallel
+
+      - name: Run suite
+        run: |
+          case "${{ matrix.label }}" in
+            e2e*)
+              CC_TIMEOUT=300 bash test/e2e/run_e2e.sh build/fakecc ${{ matrix.opt }}
+              ;;
+            multi/cli/compile/ports)
+              bash test/e2e/run_multi_e2e.sh build/fakecc -O0
+              bash test/e2e/run_multi_e2e.sh build/fakecc -O1
+              bash test/e2e/run_cli_e2e.sh build/fakecc
+              CC_TIMEOUT=300 bash test/compile/gcc_compile/run_compile.sh build/fakecc -O0
+              CC_TIMEOUT=300 bash test/compile/gcc_compile/run_compile.sh build/fakecc -O1
+              bash test/app_ports/run_all.sh build/fakecc -O0
+              bash test/app_ports/run_all.sh build/fakecc -O1
               ;;
           esac
