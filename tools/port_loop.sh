@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Porting loop for darwin-arm64.
 #
-# Each pass does the same thing: run the unit tests, run the full e2e suite,
-# and re-audit the skipped cases.  The point is that none of the three needs a
-# human to decide whether the pass was good -- the numbers are comparable
-# between passes, and a regression in any of them stops the loop.
+# Each pass runs the unit tests, the main e2e suite, the multi-TU suite, the
+# CLI suite, and re-audits the skipped cases.  The point is that none of them
+# needs a human to decide whether the pass was good -- the numbers are
+# comparable between passes, and a regression in any of them stops the loop.
+#
+# The multi-TU and CLI suites are here because the main e2e suite compiles one
+# TU at a time and never reads an object it did not write, so a multi-TU or
+# foreign-object regression is invisible to it.  The shared-library suite is
+# reported only: it is ELF end to end and skips itself elsewhere.
 #
 #   ./tools/port_loop.sh            # one pass (default)
 #   ./tools/port_loop.sh --watch N  # N passes, stopping on the first failure
@@ -110,11 +115,34 @@ cd "$ROOT" || exit 2
 PY=${PYTHON:-/Users/mingming/.workbuddy/binaries/python/versions/3.13.12/bin/python3}
 FAKECC="$ROOT/build-local/fakecc"
 
-# The suite is the reference point; a pass that does not match it is a
-# regression regardless of how good the change looked.
-E2E_BASE_PASS=2674
-E2E_BASE_SKIP=13
+# The suites are the reference point; a pass that does not match them is a
+# regression regardless of how good the change looked.  These are per-host,
+# because "skipped" and "not applicable" both count differently: the main e2e
+# suite is ported in both directions, while run_multi_e2e and run_shlib_e2e
+# carry assertions that only exist for ELF.
+#
+# They went stale once and made the loop permanently red -- a stale skip count
+# fails the `skipped -ne baseline` arm on every pass, which is the same as no
+# loop at all.  Re-measure them whenever a skip is removed, and prefer
+# tools/skip_audit.py over hand-counting.
+HOST_OS=$(uname -s | tr 'A-Z' 'a-z')
+if [ "$HOST_OS" = "darwin" ]; then
+    E2E_BASE_PASS=2682
+    E2E_BASE_SKIP=7
+    # The remaining multi-TU failures are readelf / R_X86_64 assertions with no
+    # Mach-O counterpart, the suite asking gcc for x86-only options, and the
+    # deliberate __StaticInit refusal.  A regression here means a real count.
+    MULTI_BASE_PASS=84
+    MULTI_BASE_FAIL=26
+else
+    E2E_BASE_PASS=2674
+    E2E_BASE_SKIP=13
+    MULTI_BASE_PASS=0
+    MULTI_BASE_FAIL=999
+fi
 UNIT_TOTAL=26
+# run_cli_e2e is host-independent: it drives the driver's argument handling.
+CLI_BASE_FAIL=0
 
 passes=1
 [ "${1:-}" = "--watch" ] && passes="${2:-5}"
@@ -149,7 +177,8 @@ tree_busy() {
     fi
     # Someone else already inside the loop: its lock is the authority on that,
     # and we hold it, so the only remaining source is a second tree-level job.
-    if pgrep -f "ctest|run_e2e.sh" >/dev/null 2>&1; then
+    if pgrep -f "ctest|run_e2e.sh|run_multi_e2e.sh|run_cli_e2e.sh|run_shlib_e2e.sh" \
+            >/dev/null 2>&1; then
         log "   another ctest or e2e run is in flight; skipping this pass"
         return 1
     fi
@@ -197,6 +226,63 @@ skip_audit() {
     "$PY" "$ROOT/tools/skip_audit.py" 2>&1 | tail -8
 }
 
+# The main e2e suite compiles one TU at a time and never reads an object it
+# did not write, so a multi-TU or foreign-object regression is invisible to it.
+# Four such bugs lived there for a while (the tlv descriptor table keyed by
+# name, PAGEOFF12 scaled differently in loads than in adds, __mod_init_func's
+# eight-byte stride, and a SysV union rule that AAPCS64 does not have), so
+# the suites that can see them belong in the loop.
+multi_e2e() {
+    log "== multi-TU e2e (about 2 minutes)"
+    bash "$ROOT/test/e2e/run_multi_e2e.sh" "$RUN_DIR/fakecc" \
+        >"$RUN_DIR/multi.log" 2>&1
+    local n_pass n_fail
+    n_pass=$(grep -c '^PASS' "$RUN_DIR/multi.log" || true)
+    n_fail=$(grep -c '^FAIL' "$RUN_DIR/multi.log" || true)
+    log "   $n_pass passed, $n_fail failed"
+    if [ "$n_pass" -lt "$MULTI_BASE_PASS" ]; then
+        log "   below baseline (expected >=$MULTI_BASE_PASS passed)"
+        grep '^FAIL' "$RUN_DIR/multi.log" | head -20 | sed 's/^/     /'
+        return 1
+    fi
+    if [ "$n_fail" -gt "$MULTI_BASE_FAIL" ]; then
+        log "   above baseline (at most $MULTI_BASE_FAIL expected to fail)"
+        grep '^FAIL' "$RUN_DIR/multi.log" | head -20 | sed 's/^/     /'
+        return 1
+    fi
+    return 0
+}
+
+cli_e2e() {
+    log "== CLI e2e"
+    bash "$ROOT/test/e2e/run_cli_e2e.sh" "$RUN_DIR/fakecc" \
+        >"$RUN_DIR/cli.log" 2>&1
+    local line
+    line=$(grep -oE '[0-9]+ passed, [0-9]+ failed' "$RUN_DIR/cli.log" | tail -1)
+    log "   ${line:-no summary (see "$RUN_DIR/cli.log")}"
+    if [ -z "$line" ]; then
+        grep '^FAIL' "$RUN_DIR/cli.log" | head -20 | sed 's/^/     /'
+        return 1
+    fi
+    if [ "$(echo "$line" | awk '{print $3}')" != "0" ]; then
+        log "   FAILING CASES:"
+        grep '^FAIL' "$RUN_DIR/cli.log" | head -20 | sed 's/^/     /'
+        return 1
+    fi
+    return 0
+}
+
+# Reported, not gated: on darwin it skips itself as ELF-only, and on linux the
+# baseline above is a placeholder, so there is nothing here to compare against.
+shlib_e2e() {
+    log "== shared-library e2e (ELF only; skips on non-linux)"
+    bash "$ROOT/test/e2e/run_shlib_e2e.sh" "$RUN_DIR/fakecc" \
+        >"$RUN_DIR/shlib.log" 2>&1
+    local rc=$?
+    log "   $(grep -E '^[0-9]+ passed|^SKIP' "$RUN_DIR/shlib.log" | head -1)"
+    return 0
+}
+
 one_pass() {
     rule
     log "pass $*  -- $(date '+%H:%M:%S')"
@@ -227,6 +313,19 @@ one_pass() {
         PASS_FAILED=1
         return 4
     fi
+    if ! multi_e2e; then
+        record_state "multi-failed $(date '+%H:%M:%S')"
+        log "MULTI-TU E2E FAILED"
+        PASS_FAILED=1
+        return 5
+    fi
+    if ! cli_e2e; then
+        record_state "cli-failed $(date '+%H:%M:%S')"
+        log "CLI E2E FAILED"
+        PASS_FAILED=1
+        return 6
+    fi
+    shlib_e2e
     skip_audit
     rule
     log "pass $* clean"
