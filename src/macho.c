@@ -1489,6 +1489,20 @@ int macho_write_object(const EmitModule *em, const char *path) {
     return 0;
 }
 
+/* Mach-O's section_64.sectname is exactly 16 bytes and ld64 does use all
+ * sixteen of them -- __compact_unwind is a real, everyday section whose name
+ * has no room for a terminator.  strcmp therefore never matches it, and the
+ * section drops out of the object for no visible reason.  Compare within the
+ * field's width instead: a shorter name has to be followed by a NUL, and a
+ * name that fills all 16 bytes matches when it too fills all 16. */
+static int sect_is(const char *sect, const char *name) {
+    for (int i = 0; i < 16; i++) {
+        if (name[i] == '\0') return sect[i] == '\0';
+        if (sect[i] != name[i]) return 0;
+    }
+    return name[16] == '\0';
+}
+
 int macho_read_object(const char *path, EmitModule *em) {
     /* An object file carries no user/package distinction -- only a module
      * the driver built from a command-line source is a user TU.  Clear it so
@@ -1530,6 +1544,8 @@ int macho_read_object(const char *path, EmitModule *em) {
         uint64_t addr, size;
         uint32_t offset, reloff, nreloc, flags, align;
         uint16_t shndx;
+        int      meta;   /* link-time metadata: bytes kept, relocations not */
+        int      known_unsupported;
     } RSec;
     RSec secs[16];
     int nsec = 0;
@@ -1564,10 +1580,34 @@ int macho_read_object(const char *path, EmitModule *em) {
                 rs->flags = sec.flags;
                 rs->align = sec.align;
                 rs->shndx = 0;
-                if (strcmp(rs->sect, "__text") == 0) rs->shndx = SECT_TEXT;
-                else if (strcmp(rs->sect, "__const") == 0) rs->shndx = SECT_RODATA;
-                else if (strcmp(rs->sect, "__data") == 0) rs->shndx = SECT_DATA;
-                else if (strcmp(rs->sect, "__bss") == 0) rs->shndx = SECT_BSS;
+                if (sect_is(rs->sect, "__text")) rs->shndx = SECT_TEXT;
+                /* Read-only data arrives under a family of names, and ld64
+                 * emits as many as a translation unit needs: __const next to
+                 * __cstring next to the literal pools.  They are all just
+                 * bytes we must keep addressable, because a relocation can
+                 * name anything in them. */
+                else if (sect_is(rs->sect, "__const")
+                         || sect_is(rs->sect, "__cstring")
+                         || sect_is(rs->sect, "__ustring")
+                         || sect_is(rs->sect, "__literal4")
+                         || sect_is(rs->sect, "__literal8")
+                         || sect_is(rs->sect, "__literal16"))
+                    rs->shndx = SECT_RODATA;
+                else if (sect_is(rs->sect, "__data")) rs->shndx = SECT_DATA;
+                else if (sect_is(rs->sect, "__bss")) rs->shndx = SECT_BSS;
+                /* __compact_unwind carries a local symbol, so it cannot just
+                 * be ignored: skipping it outright would shift every symbol
+                 * index and break the relocations that follow.  Its own
+                 * relocations are section-relative entries into the unwind
+                 * table, which only means something to ld64, so the bytes
+                 * travel along as ordinary read-only data and those records
+                 * are dropped.  The image ends up without unwind info --
+                 * fakecc emits none of its own either way. */
+                else if (sect_is(rs->sect, "__compact_unwind")
+                         || sect_is(rs->sect, "__eh_frame")) {
+                    rs->shndx = SECT_RODATA;
+                    rs->meta = 1;
+                }
                 /* The thread-local names are fixed by ld64; matching on the
                  * section type as well means an object written by another
                  * tool still tells us which half of the block it is.  The
@@ -1575,15 +1615,46 @@ int macho_read_object(const char *path, EmitModule *em) {
                  * types differ only in bits 0 and 1 -- so it has to be
                  * compared whole, not masked, or the zero-fill type matches
                  * the regular one. */
-                else if (strcmp(rs->sect, "__thread_data") == 0
+                else if (sect_is(rs->sect, "__thread_data")
                          || (sec.flags & 0xFFu) == S_THREAD_LOCAL_REGULAR)
                     rs->shndx = SECT_TDATA;
-                else if (strcmp(rs->sect, "__thread_bss") == 0
+                else if (sect_is(rs->sect, "__thread_bss")
                          || (sec.flags & 0xFFu) == S_THREAD_LOCAL_ZEROFILL)
                     rs->shndx = SECT_TBSS;
-                else if (strcmp(rs->sect, "__init_array") == 0)
+                /* The descriptor table.  Nothing here is copied: its binds
+                 * and its per-descriptor offsets describe a block layout this
+                 * linker is about to merge and renumber, so the table is
+                 * rebuilt from scratch.  The section still has to be
+                 * *recognised*, because that is where a thread-local symbol
+                 * points -- see the symbol loop. */
+                else if (sect_is(rs->sect, "__thread_vars")
+                         || (sec.flags & 0xFFu) == S_THREAD_LOCAL_VARIABLES) {
+                    rs->shndx = SECT_TVARS;
+                    rs->meta = 1;
+                }
+                /* ld64's static-initialisation stub.  Recognised so the
+                 * diagnostic can say what is missing, but deliberately not
+                 * merged: the section's declared size stops short of the
+                 * `__GLOBAL_init_<prio>` entry stub that sits just past its
+                 * end, and that stub -- which holds the constructor body and
+                 * the once-only guard -- is generated by the linker.  Wiring
+                 * up the part that exists and calling into the part that does
+                 * not produces an image that branches to itself forever, so a
+                 * clear refusal is the better failure. */
+                else if (sect_is(rs->sect, "__StaticInit")) {
+                    rs->known_unsupported = 1;
+                }
+                /* Clang's constructor / destructor lists.  Same job as
+                 * __init_array, under the name the ELF-shaped toolchain uses,
+                 * and what a stock clang .o carries for __attribute__
+                 * ((constructor)) and friends. */
+                else if (sect_is(rs->sect, "__mod_init_func"))
                     rs->shndx = SECT_INIT_ARRAY;
-                else if (strcmp(rs->sect, "__fini_array") == 0)
+                else if (sect_is(rs->sect, "__mod_term_func"))
+                    rs->shndx = SECT_FINI_ARRAY;
+                else if (sect_is(rs->sect, "__init_array"))
+                    rs->shndx = SECT_INIT_ARRAY;
+                else if (sect_is(rs->sect, "__fini_array"))
                     rs->shndx = SECT_FINI_ARRAY;
             }
         } else if (cmd == LC_SYMTAB && cmdsize >= sizeof(symtab_command)) {
@@ -1598,6 +1669,45 @@ int macho_read_object(const char *path, EmitModule *em) {
     }
 
     emit_module_init(em);
+    /* A pointer stored in read-only data needs a chained fixup, and dyld only
+     * applies those to writable pages -- __TEXT is mapped r-x.  So a
+     * read-only section that carries data relocations has to travel to
+     * __DATA instead, which is the same call fakecc's own codegen makes for a
+     * const object holding a pointer.  Decided before any bytes are copied,
+     * because the section kind decides the destination buffer. */
+    for (int i = 0; i < nsec; i++) {
+        RSec *rs = &secs[i];
+        if (rs->meta) continue;
+        if (rs->shndx != SECT_RODATA || !rs->nreloc) continue;
+        if ((uint64_t)rs->reloff + (uint64_t)rs->nreloc * 8 > (uint64_t)fsize)
+            continue;   /* out of range: reported with a better message later */
+        for (uint32_t k = 0; k < rs->nreloc; k++) {
+            uint32_t w = 0;
+            memcpy(&w, buf + rs->reloff + k * 8 + 4, 4);
+            uint32_t typ = (w >> 28) & 0xFu;
+            if (typ == 0 || typ == 1) { rs->shndx = SECT_DATA; break; }
+        }
+    }
+    /* The alignment the object itself used for its thread block.  A
+     * descriptor's block offset is measured from the start of that block, so
+     * telling an initialized variable from a zero-filled one means knowing
+     * where the second half begins -- which is the template's size rounded up
+     * to exactly this. */
+    size_t tls_max_align = 8;
+    for (int i = 0; i < nsec; i++) {
+        if (secs[i].shndx != SECT_TDATA && secs[i].shndx != SECT_TBSS) continue;
+        if (secs[i].align >= 16) continue;
+        size_t al = (size_t)1 << secs[i].align;
+        if (al > tls_max_align) tls_max_align = al;
+    }
+    /* Where each section's bytes landed inside its destination buffer.  One
+     * fakecc buffer holds several input sections -- a clang object alone
+     * splits read-only data across __const, __cstring and the literal pools
+     * -- and the linker adds one base per buffer per module, so a symbol's
+     * value has to carry the offset of its own section within that buffer or
+     * the last section written would land on top of the first. */
+    size_t secbuf_off[16];
+    memset(secbuf_off, 0, sizeof secbuf_off);
     for (int i = 0; i < nsec; i++) {
         RSec *rs = &secs[i];
         if (rs->shndx == 0) continue;
@@ -1643,6 +1753,7 @@ int macho_read_object(const char *path, EmitModule *em) {
                     : rs->shndx == SECT_RODATA ? &em->rodata
                     : rs->shndx == SECT_TDATA ? &em->tdata
                     : &em->data;
+        secbuf_off[i] = dst->len;
         buffer_append(dst, (const char *)buf + rs->offset, (size_t)rs->size);
     }
     for (int i = 0; i < nsec; i++) {
@@ -1672,6 +1783,49 @@ int macho_read_object(const char *path, EmitModule *em) {
         return -1;
     }
     const char *str = (const char *)buf + stroff;
+    /* Defined symbols are collected first and emitted in a second pass,
+     * because resolving a thread-local one means following its descriptor to
+     * another symbol in the same table -- and that symbol can sit anywhere in
+     * it, or even not exist. */
+    typedef struct {
+        const char *name;
+        uint8_t     binding, ty, desc;
+        uint16_t    shndx_raw;
+        uint32_t    sect;        /* 1-based section index, as in n_sect */
+        uint64_t    value;       /* raw n_value */
+        uint64_t    size;        /* tentative definition: n_value is the size */
+    } DefSym;
+    DefSym *defs = nsyms ? xmalloc(nsyms * sizeof(DefSym)) : NULL;
+    size_t ndef = 0;
+    /* Descriptor slot within __thread_vars -> target symbol index.  Only the
+     * third word of a descriptor is filled in from the object; the first is
+     * the thunk bind every descriptor shares. */
+    int32_t *tvar_target = NULL;
+    size_t n_tvar_desc = 0;
+    for (int i = 0; i < nsec; i++) {
+        if (secs[i].shndx != SECT_TVARS) continue;
+        size_t ndesc = secs[i].size / 24;
+        if (ndesc == 0) continue;
+        int32_t *grown = xrealloc(tvar_target,
+                                  (n_tvar_desc + ndesc) * sizeof(int32_t));
+        if (!grown) { fprintf(stderr, "fakecc: OOM\n"); exit(1); }
+        tvar_target = grown;
+        for (size_t k = 0; k < ndesc; k++) tvar_target[n_tvar_desc + k] = -1;
+        n_tvar_desc += ndesc;
+        if (!secs[i].nreloc) continue;
+        if ((uint64_t)secs[i].reloff + (uint64_t)secs[i].nreloc * 8 > (uint64_t)fsize)
+            continue;   /* out of range: reported with a better message later */
+        for (uint32_t k = 0; k < secs[i].nreloc; k++) {
+            int32_t at = 0;
+            uint32_t word = 0;
+            memcpy(&at, buf + secs[i].reloff + k * 8, 4);
+            memcpy(&word, buf + secs[i].reloff + k * 8 + 4, 4);
+            if (at < 0 || at % 24 != 16) continue;
+            size_t idx = (size_t)at / 24;
+            if (idx >= ndesc) continue;
+            tvar_target[n_tvar_desc - ndesc + idx] = (int32_t)(word & 0xFFFFFFu);
+        }
+    }
     for (uint32_t i = 0; i < nsyms; i++) {
         nlist_64 nl;
         memcpy(&nl, buf + symoff + i * sizeof nl, sizeof nl);
@@ -1679,43 +1833,146 @@ int macho_read_object(const char *path, EmitModule *em) {
         if (raw[0] == '_') raw++;
         int undef = nl.n_sect == 0;
         if (undef) {
+            DefSym *d = &defs[ndef++];
+            memset(d, 0, sizeof *d);
+            d->name = raw;
+            d->desc = (uint8_t)(nl.n_desc & 0x0020u);
+            d->shndx_raw = SECT_UNDEF;
+            d->value = nl.n_value;
+            /* A tentative definition has a name, a type and no section:
+             * n_value is its size, and the alignment rides in the low
+             * descriptor bits.  A plain undefined reference has a zero value
+             * and is weak when the symbol says so.  Which of the two it is
+             * decides whether the symbol is allocated at link time at all. */
             if (nl.n_value > 0 && (nl.n_type & N_EXT)) {
                 unsigned log = ((unsigned)nl.n_desc >> 8) & 0x0fu;
-                size_t align = log ? (size_t)1 << log : 1;
-                emit_module_add_symbol(em, raw[0] ? raw : NULL, 1, 1,
-                                       SHN_COMMON, align, (size_t)nl.n_value);
+                d->binding = 1;
+                d->value = log ? (size_t)1 << log : 1;   /* alignment */
+                d->size = nl.n_value;                     /* bytes wanted */
             } else {
-                uint8_t binding = (nl.n_desc & 0x0040) ? 2 : 1;
-                emit_module_add_symbol(em, raw[0] ? raw : NULL, binding, 0,
-                                       SECT_UNDEF, 0, 0);
+                d->binding = (nl.n_desc & 0x0040) ? 2 : 1;
             }
-            if (em->num_syms)
-                em->syms[em->num_syms - 1].macho_desc =
-                    (uint16_t)(nl.n_desc & 0x0020u);
             continue;
         }
         if (nl.n_sect > nsec || secs[nl.n_sect - 1].shndx == 0) {
-            free(buf);
+            /* Name the symbol and its section: "unsupported section" alone
+             * has cost real time on its own, because the usual cause is a
+             * section this reader simply does not know yet. */
+            const char *where = (nl.n_sect <= nsec)
+                ? secs[nl.n_sect - 1].sect : "?";
+            int known = (nl.n_sect <= nsec)
+                ? secs[nl.n_sect - 1].known_unsupported : 0;
+            free(buf); free(defs); free(tvar_target);
             emit_module_free(em);
-            fprintf(stderr, "fakecc: '%s' symbol in an unsupported section\n", path);
+            if (known) {
+                fprintf(stderr,
+                        "fakecc: '%s': a %s is out of reach -- this linker "
+                        "does not generate ld64's __GLOBAL_init_<prio> entry "
+                        "stub yet, and the constructor body lives in it\n",
+                        path, where);
+                return -1;
+            }
+            fprintf(stderr, "fakecc: '%s' symbol '%s' in unsupported section "
+                    "%s,%s\n", path, raw[0] ? raw : "?", where,
+                    (nl.n_sect <= nsec) ? secs[nl.n_sect - 1].seg : "?");
             return -1;
         }
         RSec *rs = &secs[nl.n_sect - 1];
-        uint8_t binding = (nl.n_desc & 0x0080) ? 2
-                        : (nl.n_type & N_PEXT) ? 3
-                        : (nl.n_type & N_EXT) ? 1 : 0;
-        uint8_t ty = rs->shndx == SECT_TEXT ? 2 : 1;
-        size_t value = (size_t)(nl.n_value - rs->addr);
-        emit_module_add_symbol(em, raw[0] ? raw : NULL, binding, ty,
-                               rs->shndx, value, 0);
-        if (em->num_syms)
-            em->syms[em->num_syms - 1].macho_desc =
-                (uint16_t)(nl.n_desc & 0x0020u);
+        DefSym *d = &defs[ndef++];
+        memset(d, 0, sizeof *d);
+        d->name = raw;
+        d->binding = (nl.n_desc & 0x0080) ? 2
+                   : (nl.n_type & N_PEXT) ? 3
+                   : (nl.n_type & N_EXT) ? 1 : 0;
+        d->desc = (uint8_t)(nl.n_desc & 0x0020u);
+        d->shndx_raw = rs->shndx;
+        d->sect = nl.n_sect;
+        d->value = nl.n_value;
     }
+    /* Emitted in nlist order, undefined entries included: relocation records
+     * name nlist indices, so anything else silently renumbers the symbol
+     * table out from under them -- every reloc then lands on the wrong
+     * symbol, which for a thread-local pair means the two variables swap
+     * storage and read each other's bytes. */
+    for (size_t k = 0; k < ndef; k++) {
+        DefSym *d = &defs[k];
+        uint16_t sh = d->shndx_raw;
+        size_t value;
+        if (sh == SECT_UNDEF) {
+            int common = d->size > 0;
+            emit_module_add_symbol(em, d->name[0] ? d->name : NULL,
+                                   d->binding, common ? 1 : 0,
+                                   common ? (uint16_t)SHN_COMMON
+                                          : (uint16_t)SECT_UNDEF,
+                                   common ? d->value : 0,
+                                   common ? (size_t)d->size : 0);
+            if (em->num_syms)
+                em->syms[em->num_syms - 1].macho_desc = d->desc;
+            continue;
+        }
+        if (sh == SECT_TVARS) {
+            /* A thread-local symbol has no address of its own -- every
+             * thread gets its own copy -- so it points at its 24-byte
+             * tlv_descriptor.  In a *relocatable* object the descriptor's
+             * third word is not the block offset: it is a relocation naming
+             * `x$tlv$init`, the initializer for a dynamically-resolved block,
+             * which in the static case is the variable's own storage.  That
+             * target is the only thing in the object saying which half of the
+             * template the variable occupies, so follow it -- reading the
+             * word as a number instead puts every variable at offset 0, and
+             * they all share one slot at run time. */
+            uint64_t desc_off = (size_t)(d->value - secs[d->sect - 1].addr);
+            int32_t tgt = -1;
+            if (desc_off % 24 == 0 && desc_off / 24 < n_tvar_desc)
+                tgt = tvar_target[desc_off / 24];
+            if (tgt >= 0 && (size_t)tgt < ndef) {
+                DefSym *td = &defs[tgt];
+                if (td->shndx_raw == SECT_TDATA || td->shndx_raw == SECT_TBSS) {
+                    sh = td->shndx_raw;
+                    value = secbuf_off[td->sect - 1]
+                          + (size_t)(td->value - secs[td->sect - 1].addr);
+                } else {
+                    tgt = -1;
+                }
+            } else {
+                tgt = -1;
+            }
+            if (tgt < 0) {
+                /* Not every symbol in the table is a variable.  ld64 drops
+                 * local `ltmpN` labels inside __thread_vars, and no
+                 * relocation ever names one -- but they still occupy an nlist
+                 * slot, and this reader's symbol indices have to line up with
+                 * the relocation records, so they cannot simply be dropped.
+                 * An *external* one is a real thread-local whose descriptor we
+                 * failed to make sense of, and that is worth an error. */
+                if (d->binding != 0) {
+                    free(buf); free(defs); free(tvar_target);
+                    emit_module_free(em);
+                    fprintf(stderr, "fakecc: '%s' thread-local symbol '%s' has "
+                            "no usable initializer in its descriptor\n", path,
+                            d->name[0] ? d->name : "?");
+                    return -1;
+                }
+                value = desc_off;
+            }
+        } else {
+            /* Section-relative, plus wherever this section landed in the
+             * buffer it was merged into -- see secbuf_off above. */
+            value = secbuf_off[d->sect - 1]
+                  + (size_t)(d->value - secs[d->sect - 1].addr);
+        }
+        uint8_t ty = sh == SECT_TEXT ? 2 : 1;
+        emit_module_add_symbol(em, d->name[0] ? d->name : NULL, d->binding, ty,
+                               sh, value, 0);
+        if (em->num_syms)
+            em->syms[em->num_syms - 1].macho_desc = d->desc;
+    }
+    free(defs);
+    free(tvar_target);
 
     for (int i = 0; i < nsec; i++) {
         RSec *rs = &secs[i];
-        if (!rs->nreloc) continue;
+        if (!rs->nreloc || rs->meta) continue;
         if ((uint64_t)rs->reloff + (uint64_t)rs->nreloc * 8 > (uint64_t)fsize) {
             free(buf);
             emit_module_free(em);
@@ -1724,6 +1981,9 @@ int macho_read_object(const char *path, EmitModule *em) {
         }
         int32_t pending = 0;
         int have_pending = 0;
+        /* Section-relative until now: the linker merges buffers, so the slot
+         * has to be moved by the same amount its section was. */
+        size_t slot_base = secbuf_off[i];
         for (uint32_t ri = 0; ri < rs->nreloc; ri++) {
             int32_t addr = 0;
             uint32_t word = 0;
@@ -1740,14 +2000,14 @@ int macho_read_object(const char *path, EmitModule *em) {
             }
             int32_t addend = 0;
             if (type == 0 && rs->shndx == SECT_DATA &&
-                (size_t)addr + 8 <= em->data.len) {
+                (size_t)addr + slot_base + 8 <= em->data.len) {
                 int64_t full = 0;
-                memcpy(&full, em->data.data + addr, 8);
+                memcpy(&full, em->data.data + addr + slot_base, 8);
                 addend = (int32_t)full;
             } else if (type == 0 && rs->shndx == SECT_TDATA &&
-                       (size_t)addr + 8 <= em->tdata.len) {
+                       (size_t)addr + slot_base + 8 <= em->tdata.len) {
                 int64_t full = 0;
-                memcpy(&full, em->tdata.data + addr, 8);
+                memcpy(&full, em->tdata.data + addr + slot_base, 8);
                 addend = (int32_t)full;
             }
             if (have_pending) {
@@ -1763,7 +2023,8 @@ int macho_read_object(const char *path, EmitModule *em) {
                  * a slot inside __thread_data has to stay there when the
                  * linker merges the sections, or the initializer ends up
                  * rebased into __data at an offset that means nothing. */
-                emit_module_add_data_reloc(em, (size_t)addr, type, (int)sym, addend);
+                emit_module_add_data_reloc(em, (size_t)addr + slot_base,
+                                           type, (int)sym, addend);
                 em->data_relocs[em->num_data_relocs - 1].shndx = rs->shndx;
             } else
                 emit_module_add_reloc(em, (size_t)addr, type, (int)sym, addend);
@@ -2148,6 +2409,44 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
             ng++;
         }
         free(comms);
+    }
+
+    /* ld64 synthesises __dso_handle in every image: a pointer the atexit
+     * machinery uses to key registrations to the module that made them.  It
+     * is not in libSystem, so an object from any real toolchain that runs a
+     * destructor or constructor at load time references it as undefined and
+     * nothing else will satisfy it.  Give it an address of its own. */
+    if (rc == 0) {
+        int have = 0;
+        for (size_t g = 0; g < ng; g++)
+            if (strcmp(gdefs[g].name, "__dso_handle") == 0) { have = 1; break; }
+        int wanted = 0;
+        for (size_t i = 0; i < n && !wanted; i++) {
+            EmitModule *m = mods[i];
+            for (size_t s = 0; s < m->num_syms; s++) {
+                const EmitSymbol *es = &m->syms[s];
+                if (es->shndx == SECT_UNDEF && es->name
+                    && strcmp(es->name, "__dso_handle") == 0
+                    && es->binding != 2) { wanted = 1; break; }
+            }
+        }
+        if (wanted && !have) {
+            while (out.data.len % 8) { char z = 0; buffer_append(&out.data, &z, 1); }
+            if (out.data_align < 8) out.data_align = 8;
+            if (ng == capg) {
+                capg = capg ? capg * 2 : 8;
+                gdefs = xrealloc(gdefs, capg * sizeof(GDef));
+            }
+            gdefs[ng].name = xstrdup("__dso_handle");
+            gdefs[ng].sh = SECT_DATA;
+            gdefs[ng].off = out.data.len;
+            gdefs[ng].size = 8;
+            gdefs[ng].binding = 1;
+            gdefs[ng].from_user = 0;
+            ng++;
+            uint64_t z = 0;
+            buffer_append(&out.data, (const char *)&z, 8);
+        }
     }
 
     typedef struct { char *name; int32_t addend; int filled; } GotEnt;

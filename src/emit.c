@@ -265,6 +265,17 @@ static const char *const emit_darwin_imports[] = {
     "pthread_cond_broadcast",
     "pthread_cond_destroy",
     "sched_yield",
+    /* Clang's stack protector.  -fstack-protector is the distribution
+     * default, so every object it produces references these two; without
+     * them in the list a link against a stock clang .o fails with
+     * "undefined symbol". */
+    "__stack_chk_fail",
+    "__stack_chk_guard",
+    /* ld64's static-init stub registers destructors through this, so every
+     * object compiled with a destructor or a constructor that needs cleanup
+     * references it.  libSystem exports it (__dso_handle, which the stub
+     * also names, does not -- the linker synthesises that one instead). */
+    "__cxa_atexit",
 };
 
 int emit_is_darwin_import(const char *name) {

@@ -19,6 +19,8 @@
 #define SECT_TBSS   6  /* zero-initialized __thread variables (SHF_TLS) */
 #define SECT_INIT_ARRAY 7 /* .init_array constructor pointers */
 #define SECT_FINI_ARRAY 8 /* .fini_array destructor pointers */
+#define SECT_TVARS   9  /* Mach-O tlv_descriptor table (reader-internal:
+                        *   never carries bytes into an image) */
 #define INIT_PRIO_DEFAULT 65535
 
 /* ------------------------------------------------------------------ */
