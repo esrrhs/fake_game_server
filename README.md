@@ -14,6 +14,7 @@ A C-family systems programming language and optimizing self-hosting compiler tha
 - **Fully Self-Hosting**: FakeCC compiles its own source code; two-stage bootstrap produces a byte-identical fixed point (`v0/fakecc-1` == `v0/fakecc-2`).
 - **Zero Dependencies by Default**: User binaries and bootstrap artifacts link no system libc by default, producing standalone static ELF64 executables directly via its built-in ELF generator and linker.
 - **Battle-Tested Test Coverage**: Faithfully ported from official GCC test suites, featuring **1,650+ GCC C-Torture execute tests**, 1,650+ compiler robustness tests, and real-world C projects (genann, tinyexpr, tiny-AES-c, tiny-regex-c, tiny-bignum-c) with 100% pass rates under both `-O0` and `-O1`.
+- **Cross-Platform**: Supports both **Linux x86_64** (ELF64) and **macOS arm64** (Mach-O), with CI coverage on both platforms.
 
 ---
 

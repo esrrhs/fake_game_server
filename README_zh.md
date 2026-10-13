@@ -13,7 +13,8 @@
 
 - **已完全自举**：FakeCC 能编译自身源码，两级自举生成产物逐字节完全一致（Fixed Point，`v0/fakecc-1` == `v0/fakecc-2`）；
 - **默认零依赖**：用户程序与自举产物默认不链接系统 libc，直接由内置 ELF 生成器与链接器生成静态独立 ELF64 可执行文件；
-- **高严苛测试覆盖**：忠实移植 GCC 官方 **`gcc.c-torture/execute` 1,650+ 个完整执行用例**，结合 1,650+ 健壮性编译用例以及 5 个真实开源 C 项目（genann、tinyexpr、tiny-AES-c、tiny-regex-c、tiny-bignum-c）移植，全量测试在 `-O0` 和 `-O1` 下 100% 全部通过。
+- **高严苛测试覆盖**：忠实移植 GCC 官方 **`gcc.c-torture/execute` 1,650+ 个完整执行用例**，结合 1,650+ 健壮性编译用例以及 5 个真实开源 C 项目（genann、tinyexpr、tiny-AES-c、tiny-regex-c、tiny-bignum-c）移植，全量测试在 `-O0` 和 `-O1` 下 100% 全部通过；
+- **跨平台支持**：同时支持 **Linux x86_64**（ELF64）和 **macOS arm64**（Mach-O），CI 覆盖双平台测试。
 
 ---
 
