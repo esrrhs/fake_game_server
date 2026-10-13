@@ -128,3 +128,87 @@ has_runpath() {
     local bin="$1" needle="$2"
     elf_dynamic_dump "$bin" | grep '(RUNPATH)' | grep -F "$needle" >/dev/null
 }
+
+# ---------------------------------------------------------------------------
+# Mach-O equivalents of the readelf queries the suites make.
+#
+# The ELF assertions are not merely unreadable off Linux -- leaving them there
+# means the behaviour they were written to catch stops being checked at all,
+# because a skipped assertion covers nothing.  So each one gets a Mach-O
+# counterpart: same question, asked in the host's vocabulary.
+#
+# `macho_section_dump` lists sections as "name size align flags"; `macho_relocs`
+# lists relocation records as "section index type symbol name".
+# ---------------------------------------------------------------------------
+
+is_elf_host() {
+    command -v readelf >/dev/null 2>&1
+}
+
+macho_section_dump() {
+    local bin="$1"
+    [ -f "$bin" ] || return 1
+    # Only the blocks that begin with a bare "Section" line; a load command's
+    # own size/align/flags lines look the same and would otherwise be picked
+    # up as if they described a section.
+    otool -l "$bin" 2>/dev/null | awk '
+        /^Section$/ { ins = 1; name = ""; seg = ""; size = ""; align = ""; fl = ""
+                     next }
+        !ins { next }
+        /^ *sectname / { name = $2; next }
+        /^ *segname /  { seg  = $2; next }
+        /^ *size /     { size = $2; next }
+        /^ *align /    { align = $2; sub(/^2\^/, "", align); next }
+        # `flags` is the last field otool prints inside a section, so it can
+        # close the record by itself.
+        /^ *flags /    { fl = $2; sub(/^0x/, "", fl)
+                         print seg "," name, size, align, fl; ins = 0; next }
+    '
+}
+
+# True when BINARY has a section named NAME (with or without a segment prefix).
+macho_has_section() {
+    local bin="$1" name="$2"
+    macho_section_dump "$bin" | awk -v n="$name" \
+        '{ split($1, p, ","); if (p[2] == n) found = 1 } END { exit found ? 0 : 1 }'
+}
+
+# Print the alignment exponent of section NAME (Mach-O stores log2 of it).
+macho_section_align_log() {
+    local bin="$1" name="$2"
+    macho_section_dump "$bin" | awk -v n="$name" \
+        '{ split($1, p, ","); if (p[2] == n) { print $4; exit } }'
+}
+
+# List ARM64 relocation records as "section-index type symbolnum", one per line.
+# otool heads each section with "Relocation information (SEG,SECT) N entries",
+# which is what lets the section index be recovered; it prints the type as a
+# decimal already, so no decoding is needed here.
+macho_relocs() {
+    local bin="$1"
+    [ -f "$bin" ] || return 1
+    otool -r "$bin" 2>/dev/null | awk '
+        # Columns: address pcrel length extern type scattered symbolnum
+        /^Relocation information/ { ++sect; next }
+        NF >= 7 && $1 ~ /^[0-9a-f]+$/ && $2 ~ /^[01]$/ { print sect, $5, $7 }
+    '
+}
+
+# True when BINARY has a relocation of type TYPE in section index SECTIDX.
+# SECTIDX may be a name instead; then the index is looked up first.
+macho_has_reloc_type() {
+    local bin="$1" want="$2" sect="$3"
+    local idx
+    case "$sect" in
+        ''|*[!0-9]*) idx=$(macho_section_index "$bin" "$sect") || return 1 ;;
+        *) idx="$sect" ;;
+    esac
+    # macho_relocs prints "section type symbolnum".
+    macho_relocs "$bin" | awk -v t="$want" -v s="$idx" '$1 == s && $2 == t { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+# Print the 1-based section index that otool reports for section NAME.
+macho_section_index() {
+    local bin="$1" name="$2"
+    macho_section_dump "$bin" | awk -v n="$name" '{ i++; split($1, p, ","); if (p[2] == n) { print i; found = 1; exit } } END { exit found ? 0 : 1 }'
+}
