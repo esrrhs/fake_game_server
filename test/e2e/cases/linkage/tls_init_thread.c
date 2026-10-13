@@ -1,14 +1,12 @@
 // expect: 0
 // gcc_flags: -pthread
-// unsupported_on: darwin-arm64
 
-// Skipped for a different reason now that threads work: Darwin has no
-// per-thread copy of a __thread object yet.  The image carries one template
-// and the descriptor's thunk returns its address, so every thread sees the
-// same storage -- here thread 2 reads 133 where it expects 123.  Real
-// isolation needs the descriptor to live in __DATA,__thread_vars with its
-// thunk bound to _tlv_bootstrap, which dyld then swaps for a per-thread
-// address.
+// Darwin has no per-thread __thread object of its own to fall back on, so
+// this goes through the native TLV path: a tlv_descriptor in
+// __DATA,__thread_vars with its thunk bound to _tlv_bootstrap, which dyld
+// rewrites into a function returning this thread's block.  The storage is
+// the copy of __thread_data each thread gets at bootstrap, so main's copy
+// survives the workers untouched.
 package main;
 
 import runtime;

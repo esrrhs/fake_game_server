@@ -28,6 +28,8 @@ void emit_module_init(EmitModule *m) {
     m->bss_size = 0;
     buffer_init(&m->tdata);
     m->tbss_size = 0;
+    buffer_init(&m->thread_vars);
+    m->thread_vars_align = 8;
     m->text_align = 16;
     m->rodata_align = 8;
     m->data_align = 8;
@@ -67,6 +69,7 @@ void emit_module_free(EmitModule *m) {
     buffer_free(&m->rodata);
     buffer_free(&m->data);
     buffer_free(&m->tdata);
+    buffer_free(&m->thread_vars);
     buffer_free(&m->init_array);
     free(m->init_prio);
     buffer_free(&m->fini_array);

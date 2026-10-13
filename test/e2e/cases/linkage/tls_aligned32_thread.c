@@ -3,9 +3,12 @@
 
 // An aligned(32) TLS object must stay 32-aligned in a child thread too.
 //
-// Threads exist on Darwin now, so this runs.  It checks alignment only:
-// per-thread isolation is tls_init_thread's and tls_multithread's job, and
-// they are still skipped (see there).
+// The descriptor's offset field is where the variable sits inside this
+// thread's copy of the block, so the static layout has to round the
+// zero-filled half up to the strongest alignment any __thread object asked
+// for -- otherwise tx lands at offset 8 and every access to it is misaligned.
+// See macho_tlv_block_tbss_base, and tls_init_thread for the rest of the TLV
+// path.
 package main;
 import runtime;
 

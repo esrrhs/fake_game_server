@@ -1,10 +1,9 @@
 // expect: 0
 // gcc_flags: -pthread
-// unsupported_on: darwin-arm64
 
-// Skipped for a different reason now that threads work: see tls_init_thread.
-// The three workers return the right values only because they run one after
-// another; main's own copies come back changed.
+// Three workers run concurrently here, so the three threads' thread_id and
+// thread_accum copies have to be genuinely separate rather than one shared
+// block -- see tls_init_thread for how the descriptors get that.
 package main;
 
 import runtime;

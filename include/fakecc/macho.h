@@ -46,12 +46,29 @@ int macho_write_exec_text(const Buffer *text, uint64_t entry_off,
 uint32_t macho_text_offset(void);
 
 /* Image offsets (relative to the Mach-O base VA == file offsets for
- * __TEXT/__DATA file-backed content) at which __const, __data and __bss
- * land, given the final __text length.  Same layout macho_write_exec
- * uses.  An absent section yields 0. */
+ * __TEXT/__DATA file-backed content) at which every section lands, given
+ * the final __text length.  Same layout macho_write_exec uses.  An absent
+ * section yields 0.  The TLS sections matter because the descriptor table
+ * and the template have to be addressable and have to agree with each
+ * other: a descriptor's `offset` field is measured from the start of the
+ * thread block, which is __thread_data. */
+typedef struct {
+    uint64_t ro;           /* __TEXT,__const      */
+    uint64_t data;         /* __DATA,__data       */
+    uint64_t bss;          /* __DATA,__bss        */
+    uint64_t thread_vars;  /* __DATA,__thread_vars */
+    uint64_t tdata;        /* __DATA,__thread_data */
+    uint64_t tbss;         /* __DATA,__thread_bss  */
+} MachoSectOffsets;
+
 void macho_section_offsets(const struct EmitModule *em, size_t text_len,
-                           uint64_t *ro_off, uint64_t *data_off,
-                           uint64_t *bss_off);
+                           MachoSectOffsets *off);
+
+/* Where the zero-filled half of a thread's block begins, given the size of
+ * the initialized half and the strongest alignment any __thread object asked
+ * for.  Both the freestanding image and the linker use it, so the two agree
+ * on what a descriptor's `offset` field means. */
+size_t macho_tlv_block_tbss_base(size_t tdata_len, size_t max_align);
 
 /* Apply an ad-hoc code signature in place via /usr/bin/codesign.
  * Required: arm64 macOS refuses to launch unsigned static(-ish) images.

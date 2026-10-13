@@ -213,6 +213,13 @@ typedef struct EmitModule {
     size_t   bss_size; /* .bss total bytes (zero-initialized globals) */
     Buffer   tdata;    /* .tdata — initialized __thread variables */
     size_t   tbss_size;/* .tbss total bytes (zero-init __thread variables) */
+    /* Darwin thread-local variables.  tdata/tbss_size above hold the same
+     * storage for the ELF path; this is the descriptor table the Mach-O
+     * loader needs on top of it -- one 24-byte tlv_descriptor per
+     * __thread object, whose thunk field dyld rebinds to _tlv_bootstrap.
+     * Written as __DATA,__thread_vars. */
+    Buffer   thread_vars;
+    size_t   thread_vars_align;
     /* Max sh_addralign of each output section (gcc objects often use 16). */
     size_t   text_align;
     size_t   rodata_align;

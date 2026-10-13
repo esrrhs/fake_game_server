@@ -28,6 +28,11 @@
 #define MH_DYLDLINK   0x00000004u
 #define MH_TWOLEVEL   0x00000080u
 #define MH_PIE        0x00200000u
+/* "Contains a section of type S_THREAD_LOCAL_VARIABLES."  Without it dyld
+ * never looks for __thread_vars at all, so every descriptor's thunk stays
+ * the __tlv_bootstrap error stub and the first access aborts with
+ * "thread locals not initialized". */
+#define MH_HAS_TLV_DESCRIPTORS 0x00800000u
 
 #define CPU_TYPE_ARM64        0x0100000C
 #define CPU_SUBTYPE_ARM64_ALL 0
@@ -53,6 +58,13 @@
 #define S_ZEROFILL                 0x01u
 #define S_ATTR_PURE_INSTRUCTIONS   0x80000000u
 #define S_ATTR_SOME_INSTRUCTIONS   0x00000400u
+/* Thread-local storage section types.  dyld finds the descriptor table and
+ * the per-thread template by type, not by name: renaming __thread_vars to
+ * anything else still works, but changing the type to S_REGULAR makes dyld
+ * skip the image and every access abort. */
+#define S_THREAD_LOCAL_REGULAR     0x11u
+#define S_THREAD_LOCAL_ZEROFILL    0x12u
+#define S_THREAD_LOCAL_VARIABLES   0x13u
 #define N_EXT  0x01u
 #define N_PEXT 0x10u /* private external: hidden / internal visibility */
 #define N_SECT 0x0eu
@@ -259,7 +271,12 @@ static uint64_t encode_bind_ptr(uint32_t ordinal, uint32_t next) {
 static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
                               uint64_t data_file, char **data_img_out,
                               Buffer *fixblob, Buffer *trie) {
-    if (!em->data.len || data_file == 0) {
+    /* A fixup may sit in any file-backed section of __DATA, not just
+     * __data: the thread-local descriptor table is one too. */
+    uint64_t file_bytes = (uint64_t)em->data.len
+                        + (uint64_t)em->thread_vars.len
+                        + (uint64_t)em->tdata.len;
+    if (!file_bytes || data_file == 0) {
         fprintf(stderr, "fakecc: fixup with empty __data\n");
         return -1;
     }
@@ -303,12 +320,23 @@ static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
     }
     qsort(ce, n, sizeof *ce, chain_cmp);
 
-    char *img = xmalloc(em->data.len);
+    /* The patched image has to cover every file-backed section of __DATA,
+     * not just __data: the thread-local descriptor table lives in
+     * __thread_vars right behind it, and its thunk cells are binds.  A
+     * shorter buffer would push those writes past its end and leave the
+     * on-disk descriptor zero, which dyld reads as "rebase to 0". */
+    char *img = xmalloc(file_bytes);
     memcpy(img, em->data.data, em->data.len);
+    if (em->thread_vars.len)
+        memcpy(img + em->data.len, em->thread_vars.data,
+               em->thread_vars.len);
+    if (em->tdata.len)
+        memcpy(img + em->data.len + em->thread_vars.len,
+               em->tdata.data, em->tdata.len);
 
     for (size_t i = 0; i < n; i++) {
         if (ce[i].slot < data_page ||
-            ce[i].slot + 8 > data_page + em->data.len) {
+            ce[i].slot + 8 > data_page + file_bytes) {
             fprintf(stderr, "fakecc: fixup slot %#llx outside __data\n",
                     (unsigned long long)ce[i].slot);
             free(ce); free(imp_name); free(img);
@@ -405,17 +433,31 @@ static int macho_build_fixups(const EmitModule *em, uint64_t data_page,
 }
 
 /* mach_header_64 (32) + load commands, then __text at MACHO_TEXT_OFF.
- * 1024 leaves ample room for codesign's injected LC_CODE_SIGNATURE. */
-#define MACHO_TEXT_OFF 1024u
+ * The worst case is every optional section at once: __text + __const,
+ * __data + __bss + __thread_vars + __thread_data + __thread_bss, plus
+ * the fixup pair, which runs the command block past 1 KiB.  2048 leaves
+ * ample room for codesign's injected LC_CODE_SIGNATURE on top of that. */
+#define MACHO_TEXT_OFF 2048u
 
 uint32_t macho_text_offset(void) { return MACHO_TEXT_OFF; }
+
+/* A thread's block is every initialized __thread object followed by every
+ * zero-filled one, so the second half has to start at tdata_len rounded up to
+ * the strongest alignment any __thread object asked for.  That is what keeps
+ * `__thread int x __attribute__((aligned(32)))` 32-aligned *inside* the
+ * block, which is the most a static linker can arrange: dyld allocates the
+ * block itself with plain malloc alignment, so the address a program finally
+ * sees is only ever as strong as that base plus this offset. */
+size_t macho_tlv_block_tbss_base(size_t tdata_len, size_t max_align) {
+    size_t a = max_align < 8 ? 8 : max_align;
+    return (tdata_len + a - 1) & ~(a - 1);
+}
 
 /* Must stay in lock-step with the layout block in macho_write_exec. */
 static uint32_t macho_align_log(size_t al, uint32_t min_log);
 
 void macho_section_offsets(const EmitModule *em, size_t text_len,
-                           uint64_t *ro_out, uint64_t *data_out,
-                           uint64_t *bss_out) {
+                           MachoSectOffsets *o) {
     uint64_t ro_off = 0;
     if (em->rodata.len) {
         ro_off = MACHO_TEXT_OFF + (uint64_t)text_len;
@@ -426,13 +468,38 @@ void macho_section_offsets(const EmitModule *em, size_t text_len,
                                 : (uint64_t)MACHO_TEXT_OFF + text_len;
     uint64_t text_pages = (text_used + MACHO_PAGE_SIZE - 1)
                           & ~(uint64_t)(MACHO_PAGE_SIZE - 1);
-    uint64_t data_file = em->data.len
-        ? ((uint64_t)em->data.len + MACHO_PAGE_SIZE - 1)
-          & ~(uint64_t)(MACHO_PAGE_SIZE - 1)
+    /* __DATA holds every file-backed section first, then the zerofill
+     * ones: __data, __thread_vars, __thread_data, then __bss and
+     * __thread_bss.  A zerofill section in the middle would leave a hole
+     * in the file image, and the loader takes the segment's file size
+     * from the last file-backed section. */
+    uint64_t tv_off = 0, td_off = 0, tbss_off = 0;
+    uint64_t file_bytes = (uint64_t)em->data.len;
+    if (em->thread_vars.len) {
+        tv_off = text_pages + file_bytes;
+        file_bytes += (uint64_t)em->thread_vars.len;
+        td_off = text_pages + file_bytes;
+        file_bytes += (uint64_t)em->tdata.len;
+    } else if (em->tdata.len) {
+        td_off = text_pages + file_bytes;
+        file_bytes += (uint64_t)em->tdata.len;
+    }
+    uint64_t data_file_total = file_bytes
+        ? (file_bytes + MACHO_PAGE_SIZE - 1) & ~(uint64_t)(MACHO_PAGE_SIZE - 1)
         : 0;
-    if (ro_out) *ro_out = ro_off;
-    if (data_out) *data_out = em->data.len ? text_pages : 0;
-    if (bss_out) *bss_out = em->bss_size ? text_pages + data_file : 0;
+    uint64_t bss_vm = ((uint64_t)em->bss_size + 15) & ~(uint64_t)15;
+    if (em->bss_size) {
+        tbss_off = text_pages + data_file_total + bss_vm;
+    }
+    if (em->tbss_size && !em->bss_size) {
+        tbss_off = text_pages + data_file_total;
+    }
+    o->ro = ro_off;
+    o->data = em->data.len ? text_pages : 0;
+    o->bss = em->bss_size ? text_pages + data_file_total : 0;
+    o->thread_vars = tv_off;
+    o->tdata = td_off;
+    o->tbss = tbss_off;
 }
 
 int macho_write_exec_text(const Buffer *text, uint64_t entry_off,
@@ -451,7 +518,10 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     const Buffer *text = &em->text;
     const Buffer *rodata = &em->rodata;
     const Buffer *data = &em->data;
+    const Buffer *thread_vars = &em->thread_vars;
+    const Buffer *tdata = &em->tdata;
     uint64_t bss_bytes = em->bss_size;
+    uint64_t tbss_bytes = em->tbss_size;
 
     /* ── Section/segment layout ── */
     const uint32_t text_off = MACHO_TEXT_OFF;
@@ -466,16 +536,26 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     uint64_t text_pages = (text_used + MACHO_PAGE_SIZE - 1)
                           & ~(uint64_t)(MACHO_PAGE_SIZE - 1);
 
-    int data_present = (data->len > 0 || bss_bytes > 0);
+    int data_present = (data->len > 0 || bss_bytes > 0
+                        || thread_vars->len > 0 || tdata->len > 0
+                        || tbss_bytes > 0);
     uint64_t data_page = text_pages;
-    /* File-backed __data bytes occupy whole pages; __bss is a zerofill VM
-     * tail with no file representation. */
-    uint64_t data_file = data->len
-        ? ((uint64_t)data->len + MACHO_PAGE_SIZE - 1)
+    /* File-backed __data bytes occupy whole pages.  __bss and __thread_bss
+     * are zerofill VM tails with no file representation, and both come
+     * after the file-backed sections so the segment's file size still ends
+     * at its last real byte.  Must agree with macho_section_offsets. */
+    uint64_t data_file_bytes = (uint64_t)data->len
+                             + (uint64_t)thread_vars->len
+                             + (uint64_t)tdata->len;
+    uint64_t data_file = data_file_bytes
+        ? (data_file_bytes + MACHO_PAGE_SIZE - 1)
           & ~(uint64_t)(MACHO_PAGE_SIZE - 1)
         : 0;
     uint64_t bss_vm = (bss_bytes + 15) & ~(uint64_t)15;
-    uint64_t data_vm = data_file + bss_vm;
+    uint64_t tbss_vm = (tbss_bytes + 15) & ~(uint64_t)15;
+    uint64_t data_vm = data_file + bss_vm + tbss_vm;
+    uint64_t tv_off = data_page + (uint64_t)data->len;
+    uint64_t td_off = tv_off + (uint64_t)thread_vars->len;
     /* __LINKEDIT begins on the next page after the whole __DATA VM image
      * (its file offset doubles as the codesignature injection site). */
     uint64_t link_off = data_present
@@ -505,8 +585,17 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     const int has_const_sec = rodata->len > 0;
     const int has_data_sec  = data->len > 0;
     const int has_bss_sec   = bss_bytes > 0;
+    /* Thread-local variables split three ways, exactly as ld64 does:
+     * the descriptor table, the initialized template, and the zero-fill
+     * tail.  The names are not decoration -- dyld looks for them to find
+     * out how big a thread's copy has to be. */
+    const int has_tvar_sec  = thread_vars->len > 0;
+    const int has_tdata_sec = tdata->len > 0;
+    const int has_tbss_sec  = tbss_bytes > 0;
     const int n_text_secs   = 1 + (has_const_sec ? 1 : 0);
-    const int n_data_secs   = (has_data_sec ? 1 : 0) + (has_bss_sec ? 1 : 0);
+    const int n_data_secs   = (has_data_sec ? 1 : 0) + (has_bss_sec ? 1 : 0)
+                            + (has_tvar_sec ? 1 : 0) + (has_tdata_sec ? 1 : 0)
+                            + (has_tbss_sec ? 1 : 0);
 
     const uint32_t seg_plain_cmd = sizeof(segment_command_64);
     const uint32_t seg_text_cmd  =
@@ -571,7 +660,8 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
         MH_EXECUTE,
         ncmds,
         sizeofcmds,
-        MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE,
+        MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+        | (has_tvar_sec ? MH_HAS_TLV_DESCRIPTORS : 0),
         0,
     };
     APPEND_BYTES(&mh, sizeof mh);
@@ -661,6 +751,45 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
             bsec.flags = 0x1;           /* S_ZEROFILL */
             APPEND_BYTES(&bsec, sizeof bsec);
         }
+
+        if (has_tvar_sec) {
+            section_64 tsec = {0};
+            memcpy(tsec.sectname, "__thread_vars", 13);
+            memcpy(tsec.segname, "__DATA", 6);
+            tsec.addr = MACHO_BASE_VA + tv_off;
+            tsec.size = thread_vars->len;
+            tsec.offset = (uint32_t)tv_off;
+            tsec.align = macho_align_log(
+                em->thread_vars_align ? em->thread_vars_align : 8, 3);
+            tsec.flags = S_THREAD_LOCAL_VARIABLES;
+            APPEND_BYTES(&tsec, sizeof tsec);
+        }
+
+        if (has_tdata_sec) {
+            section_64 tsec = {0};
+            memcpy(tsec.sectname, "__thread_data", 13);
+            memcpy(tsec.segname, "__DATA", 6);
+            tsec.addr = MACHO_BASE_VA + td_off;
+            tsec.size = tdata->len;
+            tsec.offset = (uint32_t)td_off;
+            tsec.align = macho_align_log(em->tdata_align ? em->tdata_align : 8, 3);
+            tsec.flags = S_THREAD_LOCAL_REGULAR;
+            APPEND_BYTES(&tsec, sizeof tsec);
+        }
+
+        if (has_tbss_sec) {
+            section_64 tsec = {0};
+            memcpy(tsec.sectname, "__thread_bss", 12);
+            memcpy(tsec.segname, "__DATA", 6);
+            /* After __data and the descriptor/template sections, then
+             * __bss: all of the file-backed content comes first. */
+            tsec.addr = MACHO_BASE_VA + data_page + data_file + bss_vm;
+            tsec.size = tbss_bytes;
+            tsec.offset = 0;            /* zerofill: no file bytes */
+            tsec.align = macho_align_log(em->tbss_align ? em->tbss_align : 8, 3);
+            tsec.flags = S_THREAD_LOCAL_ZEROFILL;
+            APPEND_BYTES(&tsec, sizeof tsec);
+        }
     }
 
     /* ── LC_SEGMENT_64 __LINKEDIT (codesign fills it) ── */
@@ -741,11 +870,20 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     while ((uint64_t)out.len < text_pages)
         APPEND_ZERO((size_t)(text_pages - out.len));
 
-    /* ── __DATA segment file bytes: __data, padded through the link edit
-     * page so codesign can append its signature at link_off.  __bss has
-     * no file bytes; the kernel zero-fills the vm tail. ── */
+    /* ── __DATA segment file bytes: __data, __thread_vars, __thread_data,
+     * padded through the link edit page so codesign can append its
+     * signature at link_off.  __bss and __thread_bss have no file bytes;
+     * the kernel zero-fills the vm tail. ── */
     if (data_present) {
-        buffer_append(&out, data_img ? data_img : data->data, data->len);
+        if (data_img)
+            buffer_append(&out, data_img, data_file_bytes);
+        else {
+            buffer_append(&out, data->data, data->len);
+            if (thread_vars->len)
+                buffer_append(&out, thread_vars->data, thread_vars->len);
+            if (tdata->len)
+                buffer_append(&out, tdata->data, tdata->len);
+        }
         while ((uint64_t)out.len < link_off)
             APPEND_ZERO((size_t)(link_off - out.len));
     }
@@ -927,13 +1065,20 @@ int macho_write_object(const EmitModule *em, const char *path) {
     int has_ro = em->rodata.len > 0;
     int has_data = em->data.len > 0;
     int has_bss = em->bss_size > 0;
+    int has_tdata = em->tdata.len > 0;
+    int has_tbss = em->tbss_size > 0;
     int has_init = em->init_array.len > 0;
     int has_fini = em->fini_array.len > 0;
     size_t init_bytes = (em->init_array.len / 8) * 16;
     size_t fini_bytes = (em->fini_array.len / 8) * 16;
+    /* An object has to carry the thread-local template and its zero-fill
+     * tail, not just the descriptor-less ordinary sections: a symbol whose
+     * bytes live in __thread_data can only be named by a section that
+     * exists, and the linker needs both to build the merged thread block. */
     uint32_t nsects = 1u + (uint32_t)has_ro + (uint32_t)has_data
-                    + (uint32_t)has_bss + (uint32_t)has_init
-                    + (uint32_t)has_fini;
+                    + (uint32_t)has_bss + (uint32_t)has_tdata
+                    + (uint32_t)has_tbss
+                    + (uint32_t)has_init + (uint32_t)has_fini;
     uint32_t seg_cmdsize = (uint32_t)sizeof(segment_command_64)
                          + nsects * (uint32_t)sizeof(section_64);
     uint32_t sizeofcmds = seg_cmdsize
@@ -951,6 +1096,8 @@ int macho_write_object(const EmitModule *em, const char *path) {
     if (has_ro) sect_of[SECT_RODATA] = (uint8_t)nsec++;
     if (has_data) sect_of[SECT_DATA] = (uint8_t)nsec++;
     if (has_bss) sect_of[SECT_BSS] = (uint8_t)nsec++;
+    if (has_tdata) sect_of[SECT_TDATA] = (uint8_t)nsec++;
+    if (has_tbss) sect_of[SECT_TBSS] = (uint8_t)nsec++;
 
     uint64_t vm = 0;
     uint64_t file = content_off;
@@ -983,6 +1130,22 @@ int macho_write_object(const EmitModule *em, const char *path) {
         vm = align_up_u64(vm, al);
         sect_addr[SECT_BSS] = vm;
         vm += em->bss_size;
+    }
+    uint64_t tdata_off = 0;
+    if (has_tdata) {
+        uint64_t al = em->tdata_align ? em->tdata_align : 8;
+        vm = align_up_u64(vm, al);
+        file = align_up_u64(file, al);
+        sect_addr[SECT_TDATA] = vm;
+        tdata_off = file;
+        vm += em->tdata.len;
+        file += em->tdata.len;
+    }
+    if (has_tbss) {
+        uint64_t al = em->tbss_align ? em->tbss_align : 8;
+        vm = align_up_u64(vm, al);
+        sect_addr[SECT_TBSS] = vm;
+        vm += em->tbss_size;
     }
     uint64_t init_off = 0, fini_off = 0, init_vm = 0, fini_vm = 0;
     if (has_init) {
@@ -1023,6 +1186,9 @@ int macho_write_object(const EmitModule *em, const char *path) {
     size_t nreloc = reloc_record_count(em->relocs, em->num_relocs);
     size_t nreloc_data = reloc_record_count_sh(em->data_relocs,
                                                em->num_data_relocs, SECT_DATA);
+    size_t nreloc_tdata = reloc_record_count_sh(em->data_relocs,
+                                                em->num_data_relocs,
+                                                SECT_TDATA);
     size_t nreloc_init = reloc_record_count_sh(em->data_relocs,
                                                em->num_data_relocs,
                                                SECT_INIT_ARRAY);
@@ -1034,6 +1200,8 @@ int macho_write_object(const EmitModule *em, const char *path) {
     rel_at += nreloc * 8;
     uint64_t data_reloff = nreloc_data ? rel_at : 0;
     rel_at += nreloc_data * 8;
+    uint64_t tdata_reloff = nreloc_tdata ? rel_at : 0;
+    rel_at += nreloc_tdata * 8;
     uint64_t init_reloff = nreloc_init ? rel_at : 0;
     rel_at += nreloc_init * 8;
     uint64_t fini_reloff = nreloc_fini ? rel_at : 0;
@@ -1110,6 +1278,31 @@ int macho_write_object(const EmitModule *em, const char *path) {
         sec.flags = S_ZEROFILL;
         buffer_append(&out, (const char *)&sec, sizeof sec);
     }
+    if (has_tdata) {
+        memset(&sec, 0, sizeof sec);
+        memcpy(sec.sectname, "__thread_data", 13);
+        memcpy(sec.segname, "__DATA", 6);
+        sec.addr = sect_addr[SECT_TDATA];
+        sec.size = em->tdata.len;
+        sec.offset = (uint32_t)tdata_off;
+        sec.align = macho_align_log(em->tdata_align, 3);
+        sec.reloff = nreloc_tdata ? (uint32_t)tdata_reloff : 0;
+        sec.nreloc = (uint32_t)nreloc_tdata;
+        /* The type is what marks this as a thread-local template, so a
+         * static linker knows to concatenate it into the merged block. */
+        sec.flags = S_THREAD_LOCAL_REGULAR;
+        buffer_append(&out, (const char *)&sec, sizeof sec);
+    }
+    if (has_tbss) {
+        memset(&sec, 0, sizeof sec);
+        memcpy(sec.sectname, "__thread_bss", 12);
+        memcpy(sec.segname, "__DATA", 6);
+        sec.addr = sect_addr[SECT_TBSS];
+        sec.size = em->tbss_size;
+        sec.align = macho_align_log(em->tbss_align, 3);
+        sec.flags = S_THREAD_LOCAL_ZEROFILL;
+        buffer_append(&out, (const char *)&sec, sizeof sec);
+    }
     if (has_init) {
         memset(&sec, 0, sizeof sec);
         memcpy(sec.sectname, "__init_array", 12);
@@ -1180,6 +1373,10 @@ int macho_write_object(const EmitModule *em, const char *path) {
         while (out.len < data_off) { char z = 0; buffer_append(&out, &z, 1); }
         buffer_append(&out, em->data.data, em->data.len);
     }
+    if (has_tdata) {
+        while (out.len < tdata_off) { char z = 0; buffer_append(&out, &z, 1); }
+        buffer_append(&out, em->tdata.data, em->tdata.len);
+    }
     if (has_init) {
         while (out.len < init_off) { char z = 0; buffer_append(&out, &z, 1); }
         append_hook_section(&out, &em->init_array, em->init_prio);
@@ -1192,6 +1389,7 @@ int macho_write_object(const EmitModule *em, const char *path) {
         uint64_t rel_start = symoff;
         if (nreloc) rel_start = reloff;
         else if (nreloc_data) rel_start = data_reloff;
+        else if (nreloc_tdata) rel_start = tdata_reloff;
         else if (nreloc_init) rel_start = init_reloff;
         else if (nreloc_fini) rel_start = fini_reloff;
         while (out.len < rel_start) { char z = 0; buffer_append(&out, &z, 1); }
@@ -1217,6 +1415,8 @@ int macho_write_object(const EmitModule *em, const char *path) {
     macho_write_relocs(&out, em->relocs, em->num_relocs, nmap, em->num_syms);
     macho_write_relocs_sh(&out, em->data_relocs, em->num_data_relocs, SECT_DATA,
                           nmap, em->num_syms, 0);
+    macho_write_relocs_sh(&out, em->data_relocs, em->num_data_relocs,
+                          SECT_TDATA, nmap, em->num_syms, 0);
     macho_write_relocs_sh(&out, em->data_relocs, em->num_data_relocs,
                           SECT_INIT_ARRAY, nmap, em->num_syms, 1);
     macho_write_relocs_sh(&out, em->data_relocs, em->num_data_relocs,
@@ -1368,6 +1568,19 @@ int macho_read_object(const char *path, EmitModule *em) {
                 else if (strcmp(rs->sect, "__const") == 0) rs->shndx = SECT_RODATA;
                 else if (strcmp(rs->sect, "__data") == 0) rs->shndx = SECT_DATA;
                 else if (strcmp(rs->sect, "__bss") == 0) rs->shndx = SECT_BSS;
+                /* The thread-local names are fixed by ld64; matching on the
+                 * section type as well means an object written by another
+                 * tool still tells us which half of the block it is.  The
+                 * type is the low byte of flags, and the three thread-local
+                 * types differ only in bits 0 and 1 -- so it has to be
+                 * compared whole, not masked, or the zero-fill type matches
+                 * the regular one. */
+                else if (strcmp(rs->sect, "__thread_data") == 0
+                         || (sec.flags & 0xFFu) == S_THREAD_LOCAL_REGULAR)
+                    rs->shndx = SECT_TDATA;
+                else if (strcmp(rs->sect, "__thread_bss") == 0
+                         || (sec.flags & 0xFFu) == S_THREAD_LOCAL_ZEROFILL)
+                    rs->shndx = SECT_TBSS;
                 else if (strcmp(rs->sect, "__init_array") == 0)
                     rs->shndx = SECT_INIT_ARRAY;
                 else if (strcmp(rs->sect, "__fini_array") == 0)
@@ -1387,7 +1600,16 @@ int macho_read_object(const char *path, EmitModule *em) {
     emit_module_init(em);
     for (int i = 0; i < nsec; i++) {
         RSec *rs = &secs[i];
-        if (rs->shndx == 0 || (rs->flags & S_ZEROFILL)) continue;
+        if (rs->shndx == 0) continue;
+        /* A zerofill section has no bytes in the file: its offset is 0, so
+         * reading `size` bytes from there would splice the Mach-O header into
+         * whatever buffer got picked.  __thread_bss is zerofill too, and its
+         * size is recorded from the section header further down.  The type is
+         * the low byte of flags and has to be compared whole: masking with
+         * S_ZEROFILL also matches S_THREAD_LOCAL_REGULAR (0x11), whose bit 0
+         * is set for no reason the skip cares about. */
+        if ((rs->flags & 0xFFu) == S_ZEROFILL) continue;
+        if (rs->shndx == SECT_TBSS) continue;
         if (rs->shndx == SECT_INIT_ARRAY || rs->shndx == SECT_FINI_ARRAY) {
             if ((uint64_t)rs->offset + rs->size > (uint64_t)fsize) {
                 free(buf);
@@ -1419,12 +1641,13 @@ int macho_read_object(const char *path, EmitModule *em) {
         }
         Buffer *dst = rs->shndx == SECT_TEXT ? &em->text
                     : rs->shndx == SECT_RODATA ? &em->rodata
+                    : rs->shndx == SECT_TDATA ? &em->tdata
                     : &em->data;
         buffer_append(dst, (const char *)buf + rs->offset, (size_t)rs->size);
     }
     for (int i = 0; i < nsec; i++) {
-        if (secs[i].shndx == SECT_BSS)
-            em->bss_size = (size_t)secs[i].size;
+        if (secs[i].shndx == SECT_BSS) em->bss_size = (size_t)secs[i].size;
+        if (secs[i].shndx == SECT_TBSS) em->tbss_size = (size_t)secs[i].size;
         if (secs[i].align >= 16) continue;
         size_t al = (size_t)1 << secs[i].align;
         if (secs[i].shndx == SECT_TEXT && al > em->text_align)
@@ -1435,6 +1658,10 @@ int macho_read_object(const char *path, EmitModule *em) {
             em->data_align = al;
         else if (secs[i].shndx == SECT_BSS && al > em->bss_align)
             em->bss_align = al;
+        else if (secs[i].shndx == SECT_TDATA && al > em->tdata_align)
+            em->tdata_align = al;
+        else if (secs[i].shndx == SECT_TBSS && al > em->tbss_align)
+            em->tbss_align = al;
     }
 
     if ((uint64_t)symoff + (uint64_t)nsyms * sizeof(nlist_64) > (uint64_t)fsize ||
@@ -1517,6 +1744,11 @@ int macho_read_object(const char *path, EmitModule *em) {
                 int64_t full = 0;
                 memcpy(&full, em->data.data + addr, 8);
                 addend = (int32_t)full;
+            } else if (type == 0 && rs->shndx == SECT_TDATA &&
+                       (size_t)addr + 8 <= em->tdata.len) {
+                int64_t full = 0;
+                memcpy(&full, em->tdata.data + addr, 8);
+                addend = (int32_t)full;
             }
             if (have_pending) {
                 addend = pending;
@@ -1526,9 +1758,14 @@ int macho_read_object(const char *path, EmitModule *em) {
                 size_t slot = ((size_t)addr / 16) * 8;
                 emit_module_add_data_reloc(em, slot, type, (int)sym, 0);
                 em->data_relocs[em->num_data_relocs - 1].shndx = rs->shndx;
-            } else if (rs->shndx == SECT_DATA)
+            } else if (rs->shndx == SECT_DATA || rs->shndx == SECT_TDATA) {
+                /* The site section travels with the record: a reloc aimed at
+                 * a slot inside __thread_data has to stay there when the
+                 * linker merges the sections, or the initializer ends up
+                 * rebased into __data at an offset that means nothing. */
                 emit_module_add_data_reloc(em, (size_t)addr, type, (int)sym, addend);
-            else
+                em->data_relocs[em->num_data_relocs - 1].shndx = rs->shndx;
+            } else
                 emit_module_add_reloc(em, (size_t)addr, type, (int)sym, addend);
         }
     }
@@ -1579,6 +1816,8 @@ static size_t macho_symbol_span(const EmitModule *m, uint16_t sh, size_t off) {
     if (sh == SECT_DATA) end = m->data.len;
     else if (sh == SECT_RODATA) end = m->rodata.len;
     else if (sh == SECT_BSS) end = m->bss_size;
+    else if (sh == SECT_TDATA) end = m->tdata.len;
+    else if (sh == SECT_TBSS) end = m->tbss_size;
     else return 0;
     for (size_t s = 0; s < m->num_syms; s++) {
         const EmitSymbol *o = &m->syms[s];
@@ -1694,11 +1933,6 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
     int weak_at = (int)stub.code.len;
     a64_movz(&stub, A64_X0, 0, 0, 1);
     a64_ret(&stub, A64_LR);
-    /* One TLV thunk for the whole image.  x0 is the descriptor; the
-     * variable's template address is the third pointer. */
-    int tlv_at = (int)stub.code.len;
-    a64_ldr64(&stub, A64_X0, A64_X0, 16);
-    a64_ret(&stub, A64_LR);
     buffer_append(&out.text, stub.code.data, stub.code.len);
     a64_free(&stub);
 
@@ -1706,6 +1940,8 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
     size_t *ro_base = xmalloc(n * sizeof(size_t));
     size_t *data_base = xmalloc(n * sizeof(size_t));
     size_t *bss_base = xmalloc(n * sizeof(size_t));
+    size_t *tdata_base = xmalloc(n * sizeof(size_t));
+    size_t *tbss_base = xmalloc(n * sizeof(size_t));
     for (size_t i = 0; i < n; i++) {
         text_base[i] = out.text.len;
         if (mods[i]->text.len)
@@ -1724,12 +1960,28 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
         while (out.bss_size % bal) out.bss_size++;
         bss_base[i] = out.bss_size;
         out.bss_size += mods[i]->bss_size;
+        /* The thread block is every module's initialized part followed by
+         * every module's zero-fill part, which is the only way a static
+         * linker can build one template out of many objects. */
+        size_t tdal = mods[i]->tdata_align ? mods[i]->tdata_align : 1;
+        while (out.tdata.len % tdal) { char z = 0; buffer_append(&out.tdata, &z, 1); }
+        tdata_base[i] = out.tdata.len;
+        if (mods[i]->tdata.len)
+            buffer_append(&out.tdata, mods[i]->tdata.data, mods[i]->tdata.len);
+        size_t tbal = mods[i]->tbss_align ? mods[i]->tbss_align : 1;
+        while (out.tbss_size % tbal) out.tbss_size++;
+        tbss_base[i] = out.tbss_size;
+        out.tbss_size += mods[i]->tbss_size;
         if (mods[i]->rodata_align > out.rodata_align)
             out.rodata_align = mods[i]->rodata_align;
         if (mods[i]->data_align > out.data_align)
             out.data_align = mods[i]->data_align;
         if (mods[i]->bss_align > out.bss_align)
             out.bss_align = mods[i]->bss_align;
+        if (mods[i]->tdata_align > out.tdata_align)
+            out.tdata_align = mods[i]->tdata_align;
+        if (mods[i]->tbss_align > out.tbss_align)
+            out.tbss_align = mods[i]->tbss_align;
     }
 
     /* from_user records that the definition currently held came from a
@@ -1761,6 +2013,8 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
             else if (es->shndx == SECT_RODATA) base = ro_base[i];
             else if (es->shndx == SECT_DATA) base = data_base[i];
             else if (es->shndx == SECT_BSS) base = bss_base[i];
+            else if (es->shndx == SECT_TDATA) base = tdata_base[i];
+            else if (es->shndx == SECT_TBSS) base = tbss_base[i];
             adj[i][s].off = base + es->value;
             if (!adj[i][s].defined || !es->name || es->binding == 0) continue;
             int is_main = es->shndx == SECT_TEXT && strcmp(es->name, "main") == 0;
@@ -1967,24 +2221,29 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                 ntlv++;
             }
         }
+        /* The descriptors go in their own section, not __data: dyld only
+         * swaps a thunk for a per-thread address for a descriptor it finds
+         * there, and that swap is the whole point of the table. */
         if (ntlv) {
-            while (out.data.len % 8) {
+            while (out.thread_vars.len % 8) {
                 char z = 0;
-                buffer_append(&out.data, &z, 1);
+                buffer_append(&out.thread_vars, &z, 1);
             }
-            tlv_base = out.data.len;
+            tlv_base = out.thread_vars.len;
             for (size_t g = 0; g < ntlv; g++) {
                 char z[24];
                 memset(z, 0, sizeof z);
-                buffer_append(&out.data, z, sizeof z);
+                buffer_append(&out.thread_vars, z, sizeof z);
             }
-            if (out.data_align < 8) out.data_align = 8;
+            if (out.thread_vars_align < 8) out.thread_vars_align = 8;
         }
     }
 
-    uint64_t ro_off = 0, data_off = 0, bss_off = 0;
+    MachoSectOffsets so;
+    memset(&so, 0, sizeof so);
     if (rc == 0)
-        macho_section_offsets(&out, out.text.len, &ro_off, &data_off, &bss_off);
+        macho_section_offsets(&out, out.text.len, &so);
+    uint64_t ro_off = so.ro, data_off = so.data, bss_off = so.bss;
 
     for (size_t i = 0; i < n && rc == 0; i++) {
         EmitModule *m = mods[i];
@@ -2083,6 +2342,8 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                 uint64_t base = sh == SECT_TEXT ? macho_text_offset()
                               : sh == SECT_RODATA ? ro_off
                               : sh == SECT_DATA ? data_off
+                              : sh == SECT_TDATA ? so.tdata
+                              : sh == SECT_TBSS ? so.tbss
                               : bss_off;
                 uint64_t tgt = base + off + (uint64_t)(int64_t)r->addend;
                 if (is_data[pass] && (r->shndx == SECT_INIT_ARRAY ||
@@ -2130,16 +2391,34 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                                 break;
                             }
                         }
-                        if (slot < 0 || data_off == 0) {
+                        /* The descriptor table's own section is the thing
+                         * that has to exist, not __data: a TU pair that has
+                         * nothing but __thread storage never grows a __data
+                         * section at all. */
+                        if (slot < 0 || so.thread_vars == 0) {
                             fprintf(stderr, "fakecc: tlv reloc has no slot\n");
                             rc = -1;
                             break;
                         }
-                        uint64_t desc = data_off + tlv_base + (uint64_t)slot * 24;
+                        uint64_t desc = so.thread_vars + tlv_base
+                                      + (uint64_t)slot * 24;
                         if (!tlvs[slot].filled) {
-                            emit_module_add_rebase(&out, desc,
-                                                   macho_text_offset() + (uint64_t)tlv_at);
-                            emit_module_add_rebase(&out, desc + 16, tgt);
+                            /* The thread block is every module's initialized
+                             * part followed by every module's zero-fill part,
+                             * so a variable's offset inside it is either its
+                             * tdata offset or the tdata size rounded up to
+                             * the block's own alignment plus its tbss
+                             * offset.  `off` is already the offset inside the
+                             * merged section. */
+                            size_t max_tls_al = out.tdata_align > out.tbss_align
+                                              ? out.tdata_align : out.tbss_align;
+                            size_t tbss_in_block = macho_tlv_block_tbss_base(
+                                (size_t)out.tdata.len, max_tls_al);
+                            uint64_t blk = sh == SECT_TBSS
+                                         ? (uint64_t)tbss_in_block + off : off;
+                            memcpy(out.thread_vars.data + tlv_base
+                                   + (size_t)slot * 24 + 16, &blk, 8);
+                            emit_module_add_bind(&out, desc, "_tlv_bootstrap");
                             tlvs[slot].filled = 1;
                         }
                         if (r->type == 8) patch_adrp(&w, pc, desc);
@@ -2209,19 +2488,30 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
                     uint64_t nbase = nsh == SECT_TEXT ? macho_text_offset()
                                    : nsh == SECT_RODATA ? ro_off
                                    : nsh == SECT_DATA ? data_off
+                                   : nsh == SECT_TDATA ? so.tdata
+                                   : nsh == SECT_TBSS ? so.tbss
                                    : bss_off;
+                    /* The slot's own section decides which merged buffer it
+                     * lives in: a pointer initializer in __thread_data has
+                     * to be written there, not into __data. */
+                    int slot_tdata = (r->shndx == SECT_TDATA);
+                    Buffer *slotbuf = slot_tdata ? &out.tdata : &out.data;
+                    size_t slot_base = slot_tdata ? tdata_base[i] : data_base[i];
                     int64_t diff = (int64_t)(nbase + noff + (uint64_t)(int64_t)n->addend)
                                  - (int64_t)(base + off);
-                    size_t raw = data_base[i] + r->offset;
-                    if (raw + 8 > out.data.len) {
+                    size_t raw = slot_base + r->offset;
+                    if (raw + 8 > slotbuf->len) {
                         fprintf(stderr, "fakecc: data reloc past end of section\n");
                         rc = -1;
                         break;
                     }
-                    memcpy(out.data.data + raw, &diff, 8);
+                    memcpy(slotbuf->data + raw, &diff, 8);
                     skip_pair = 1;
                 } else if (r->type == 0) {
-                    uint64_t slot = data_off + data_base[i] + r->offset;
+                    int slot_tdata = (r->shndx == SECT_TDATA);
+                    uint64_t slot = (slot_tdata ? so.tdata : data_off)
+                                  + (slot_tdata ? tdata_base[i] : data_base[i])
+                                  + r->offset;
                     emit_module_add_rebase(&out, slot, tgt);
                 } else {
                     fprintf(stderr, "fakecc: unsupported data reloc %u\n", r->type);
@@ -2328,6 +2618,7 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
     for (size_t i = 0; i < n; i++) free(adj[i]);
     free(adj);
     free(text_base); free(ro_base); free(data_base); free(bss_base);
+    free(tdata_base); free(tbss_base);
     for (size_t g = 0; g < ng; g++) free(gdefs[g].name);
     free(gdefs);
     for (size_t g = 0; g < ngot; g++) free(gots[g].name);

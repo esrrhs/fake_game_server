@@ -111,10 +111,9 @@ typedef struct {
     /* Local copy of runtime/int128.c's restoring division.  The arm64
      * image does not link the Linux runtime, and external BL is T14. */
     int               udiv_label;
-    /* Exec-mode TLV descriptors live in __data.  -1 means this global
-     * has no descriptor.  The image has one template, not a copy per thread. */
+    /* Exec-mode TLV descriptors live in __DATA,__thread_vars.  -1 means this
+     * global has no descriptor. */
     int              *tlv_off;
-    int               tlv_thunk;
     /* Exec-mode slot in __bss that holds the process envp.  -1 in an object. */
     int               environ_off;
     /* Object-file calls to functions that are not in this TU.
@@ -130,7 +129,8 @@ typedef struct {
     size_t            nlrel, caplrel;
 } C64;
 
-enum { G_RO = 1, G_DATA = 2, G_BSS = 3, G_COMMON = 4 };
+enum { G_RO = 1, G_DATA = 2, G_BSS = 3, G_COMMON = 4,
+       G_TDATA = 5, G_TBSS = 6 };
 
 static const char *note_label_sym(C64 *c, int ir_id, int a64lab) {
     const char *fn = (c->fn && c->fn->name) ? c->fn->name : "fn";
@@ -5765,6 +5765,32 @@ static void emit_udivmodti4(A64Asm *a, int label) {
 
 /* ── Module entry point ──────────────────────────────────────────── */
 
+/* A __thread global does not live in an ordinary section: its bytes are the
+ * template dyld copies into each thread, so a pointer initializer aimed at
+ * one has to be rebased inside __thread_data, not __bss.  Getting this
+ * wrong is silent -- the initializer is written to a perfectly valid slot,
+ * just the wrong one, so the variable reads back zero and the first
+ * dereference of it segfaults. */
+static uint64_t c64_sect_base(int gs, const MachoSectOffsets *so) {
+    switch (gs) {
+    case G_RO:    return so->ro;
+    case G_DATA:  return so->data;
+    case G_TDATA: return so->tdata;
+    case G_TBSS:  return so->tbss;
+    default:      return so->bss;
+    }
+}
+
+/* Same section, its own buffer: an initializer slot's bytes live in the
+ * section the variable lives in, so writing one has to pick that buffer. */
+static Buffer *c64_sect_buf(EmitModule *out, int gs) {
+    switch (gs) {
+    case G_RO:    return &out->rodata;
+    case G_TDATA: return &out->tdata;
+    default:      return &out->data;
+    }
+}
+
 void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
 (void)want_debug;  /* DWARF emission lands in T20. */
 
@@ -5792,7 +5818,6 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
     c.as = &a;
     c.ir = ir;
     c.udiv_label = -1;
-    c.tlv_thunk = -1;
     c.environ_off = -1;
 
     c.fn_label = xmalloc(ir->functions.len * sizeof(int));
@@ -5811,6 +5836,43 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
     for (size_t gi = 0; gi < ir->globals.len; gi++) {
         const IRGlobal *g = &ir->globals.data[gi];
         size_t al = g->align > 0 ? (size_t)g->align : 8;
+        /* __thread storage goes to its own block -- __thread_data for the
+         * initialized part, __thread_bss for the rest -- so that dyld can
+         * hand every thread a fresh copy of it.  goff then measures the
+         * variable's offset from the start of that block, which is exactly
+         * what a TLV descriptor's `offset` field wants. */
+        if (g->is_tls) {
+            if (g->init_bytes) {
+                while (out->tdata.len % al) { char z = 0; buffer_append(&out->tdata, &z, 1); }
+                c.gsect[gi] = G_TDATA;
+                c.goff[gi] = out->tdata.len;
+                buffer_append(&out->tdata, g->init_bytes, g->size);
+                if (al > out->tdata_align) out->tdata_align = al;
+            } else {
+                c.gsect[gi] = G_TBSS;
+                c.goff[gi] = 0; /* resolved below, once tdata's size is final */
+                if (al > out->tbss_align) out->tbss_align = al;
+            }
+            /* A __thread object can hold a pointer initializer too, and its
+             * slot needs a rebase just like a __data one does -- only the
+             * buffer it lands in differs.  Dropping these here is silent:
+             * the template keeps whatever zero bytes the initializer was
+             * built from, so the variable reads back null and the first
+             * dereference of it segfaults. */
+            for (int fi = 0; fi < g->num_fixups; fi++) {
+                if (c.npfix == c.cappfix) {
+                    c.cappfix = c.cappfix ? c.cappfix * 2 : 16;
+                    c.pfix = xrealloc(c.pfix, c.cappfix * sizeof *c.pfix);
+                }
+                c.pfix[c.npfix].gidx = (int)gi;
+                c.pfix[c.npfix].slot_off = g->fixups[fi].offset;
+                c.pfix[c.npfix].sym = g->fixups[fi].sym;
+                c.pfix[c.npfix].sub = g->fixups[fi].sub;
+                c.pfix[c.npfix].addend = g->fixups[fi].addend;
+                c.npfix++;
+            }
+            continue;
+        }
         /* A readonly global that contains a pointer must live in __DATA:
          * dyld chained fixups are applied to writable pages, and
          * __TEXT,__const is mapped read-only/execute.  A C const object
@@ -5862,23 +5924,49 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
             if (al > out->bss_align) out->bss_align = al;
         }
     }
-    if (!emit_object_mode() && c.tlv_off) {
-        int any_tls = 0;
+    /* __thread_bss is laid out from zero on its own, and the block puts it
+     * after the initialized part.  Keeping the two offsets in their own
+     * coordinate systems is what lets the linker concatenate several TUs'
+     * tdata together and then their tbss together. */
+    if (c.gsect) {
+        size_t tbss_cur = 0;
+        for (size_t gi = 0; gi < ir->globals.len; gi++) {
+            if (c.gsect[gi] != G_TBSS) continue;
+            const IRGlobal *g = &ir->globals.data[gi];
+            size_t al = g->align > 0 ? (size_t)g->align : 8;
+            while (tbss_cur % al) tbss_cur++;
+            c.goff[gi] = tbss_cur;
+            tbss_cur += g->size;
+        }
+        out->tbss_size = tbss_cur;
+    }
+    /* One 24-byte tlv_descriptor per __thread object, in __DATA,__thread_vars:
+     *   [ 0] thunk   -- dyld rebinds this to _tlv_bootstrap
+     *   [ 8] key     -- dyld assigns one per image at load time
+     *   [16] offset  -- where the variable sits inside the thread block
+     * The thunk is what makes the variable per-thread: it starts as a bind,
+     * and _tlv_bootstrap rewrites it into a function returning this thread's
+     * block.  Only the freestanding image emits descriptors here; an object
+     * leaves it to the linker, which is the one that knows where the merged
+     * block put each variable. */
+    if (!emit_object_mode() && !emit_multi_tu() && c.tlv_off) {
+        size_t max_tls_al = out->tdata_align > out->tbss_align
+                          ? out->tdata_align : out->tbss_align;
+        size_t tbss_base = macho_tlv_block_tbss_base(out->tdata.len, max_tls_al);
         for (size_t gi = 0; gi < ir->globals.len; gi++) {
             if (!ir->globals.data[gi].is_tls) continue;
-            any_tls = 1;
-            while (out->data.len % 8) {
+            while (out->thread_vars.len % 8) {
                 char z = 0;
-                buffer_append(&out->data, &z, 1);
+                buffer_append(&out->thread_vars, &z, 1);
             }
-            c.tlv_off[gi] = (int)out->data.len;
-            char desc[24];
-            memset(desc, 0, sizeof desc);
-            buffer_append(&out->data, desc, sizeof desc);
-        }
-        if (any_tls) {
-            c.tlv_thunk = a64_new_label(&a);
-            if (out->data_align < 8) out->data_align = 8;
+            c.tlv_off[gi] = (int)out->thread_vars.len;
+            uint64_t desc[3];
+            desc[0] = 0;
+            desc[1] = 0;
+            desc[2] = (uint64_t)(c.gsect[gi] == G_TBSS
+                                 ? tbss_base + c.goff[gi] : c.goff[gi]);
+            buffer_append(&out->thread_vars, (const char *)desc, sizeof desc);
+            if (out->thread_vars_align < 8) out->thread_vars_align = 8;
         }
     }
     /* The environ slot is written by the entry stub and read back by the
@@ -6039,11 +6127,6 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
             a64_word(&a, 0x14000000u); /* b, imm26 patched by the linker */
         }
     }
-    if (c.tlv_thunk >= 0) {
-        a64_bind(&a, c.tlv_thunk);
-        a64_ldr64(&a, A64_X0, A64_X0, 16);
-        a64_ret(&a, A64_LR);
-    }
 
     /* The code buffer lands after the Mach-O header pad; ADRP page fixups
      * must compute against the runtime file/VA offset. */
@@ -6070,18 +6153,16 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
      * linker concatenating sections, so what looks like a section-relative
      * offset here stops being one.  Both must record relocations instead. */
     if (!emit_object_mode() && !emit_multi_tu() && (c.ngfix || c.npfix)) {
-        uint64_t ro_off, data_off, bss_off;
-        macho_section_offsets(out, out->text.len, &ro_off, &data_off, &bss_off);
-        if (c.tlv_thunk >= 0 && a.labels[c.tlv_thunk].bound && c.tlv_off) {
-            uint64_t thunk_va = (uint64_t)macho_text_offset()
-                              + a.labels[c.tlv_thunk].pos;
+        MachoSectOffsets so;
+        macho_section_offsets(out, out->text.len, &so);
+        /* Each descriptor's thunk is a pointer dyld has to fill in, so it
+         * is a bind rather than the rebase a self-referential pointer
+         * would be.  key and offset are already final in the file. */
+        if (c.tlv_off) {
             for (size_t gi = 0; gi < ir->globals.len; gi++) {
                 if (c.tlv_off[gi] < 0) continue;
-                uint64_t desc = data_off + (uint64_t)c.tlv_off[gi];
-                uint64_t base = c.gsect[gi] == G_RO ? ro_off
-                              : c.gsect[gi] == G_DATA ? data_off : bss_off;
-                emit_module_add_rebase(out, desc, thunk_va);
-                emit_module_add_rebase(out, desc + 16, base + c.goff[gi]);
+                emit_module_add_bind(out, so.thread_vars + (uint64_t)c.tlv_off[gi],
+                                     "_tlv_bootstrap");
             }
         }
         for (size_t i = 0; i < c.ngfix; i++) {
@@ -6092,7 +6173,7 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
                            "arm64 backend: thread-local variable has no descriptor");
                     continue;
                 }
-                uint64_t desc = data_off + (uint64_t)c.tlv_off[gi];
+                uint64_t desc = so.thread_vars + (uint64_t)c.tlv_off[gi];
                 uint64_t pc = (uint64_t)macho_text_offset() + c.gfix[i].at;
                 int64_t pages = (int64_t)((desc & ~(uint64_t)0xFFF)
                                           - (pc & ~(uint64_t)0xFFF)) >> 12;
@@ -6110,15 +6191,14 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
             }
             uint64_t tgt;
             if (c.gfix[i].bind >= 0) {
-                tgt = data_off + (uint64_t)c.bind_off[c.gfix[i].bind]
+                tgt = so.data + (uint64_t)c.bind_off[c.gfix[i].bind]
                     + (uint64_t)c.gfix[i].addend;
                 emit_module_add_bind(out, tgt, c.gfix[i].name);
             } else if (gi < 0) {
-                tgt = bss_off + (uint64_t)c.environ_off
+                tgt = so.bss + (uint64_t)c.environ_off
                     + (uint64_t)c.gfix[i].addend;
             } else {
-                uint64_t base = c.gsect[gi] == G_RO ? ro_off
-                              : c.gsect[gi] == G_DATA ? data_off : bss_off;
+                uint64_t base = c64_sect_base(c.gsect[gi], &so);
                 tgt = base + c.goff[gi] + (uint64_t)c.gfix[i].addend;
             }
             uint64_t pc = (uint64_t)macho_text_offset() + c.gfix[i].at;
@@ -6136,8 +6216,7 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
         for (size_t i = 0; i < c.npfix; i++) {
             int gi = c.pfix[i].gidx;
             const IRGlobal *g = &ir->globals.data[gi];
-            uint64_t gbase = c.gsect[gi] == G_RO ? ro_off
-                           : c.gsect[gi] == G_DATA ? data_off : bss_off;
+            uint64_t gbase = c64_sect_base(c.gsect[gi], &so);
             uint64_t slot = gbase + c.goff[gi] + (uint64_t)c.pfix[i].slot_off;
             if (c.pfix[i].sub) {
                 int pgi = find_global_idx(ir, c.pfix[i].sym);
@@ -6147,23 +6226,21 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
                            "arm64 backend: symbol difference is not local");
                     continue;
                 }
-                uint64_t pb = c.gsect[pgi] == G_RO ? ro_off
-                            : c.gsect[pgi] == G_DATA ? data_off : bss_off;
-                uint64_t nb = c.gsect[ngi] == G_RO ? ro_off
-                            : c.gsect[ngi] == G_DATA ? data_off : bss_off;
+                uint64_t pb = c64_sect_base(c.gsect[pgi], &so);
+                uint64_t nb = c64_sect_base(c.gsect[ngi], &so);
                 int64_t diff = (int64_t)(pb + c.goff[pgi])
                              - (int64_t)(nb + c.goff[ngi])
                              + c.pfix[i].addend;
+                Buffer *gb = c64_sect_buf(out, c.gsect[gi]);
                 size_t raw = c.goff[gi] + (size_t)c.pfix[i].slot_off;
-                if (raw + 8 <= out->data.len)
-                    memcpy(out->data.data + raw, &diff, 8);
+                if (raw + 8 <= gb->len)
+                    memcpy(gb->data + raw, &diff, 8);
                 continue;
             }
             int tgi = find_global_idx(ir, c.pfix[i].sym);
             int64_t tgt;
             if (tgi >= 0) {
-                uint64_t tb = c.gsect[tgi] == G_RO ? ro_off
-                            : c.gsect[tgi] == G_DATA ? data_off : bss_off;
+                uint64_t tb = c64_sect_base(c.gsect[tgi], &so);
                 tgt = (int64_t)(tb + c.goff[tgi]) + c.pfix[i].addend;
             } else {
                 int fi = 0;
@@ -6233,9 +6310,15 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
             const IRGlobal *g = &ir->globals.data[gi];
             if (gsym) gsym[gi] = -1;
             if (!g->name || !c.gsect) continue;
+            /* A __thread global is SECT_TDATA / SECT_TBSS, not SECT_BSS:
+             * an object has to say which section its bytes came from, or
+             * the linker merges the template into plain zero-fill and
+             * dyld never sees an initialized thread-local. */
             uint16_t sh = c.gsect[gi] == G_COMMON ? (uint16_t)SHN_COMMON
                         : c.gsect[gi] == G_RO ? (uint16_t)SECT_RODATA
                         : c.gsect[gi] == G_DATA ? (uint16_t)SECT_DATA
+                        : c.gsect[gi] == G_TDATA ? (uint16_t)SECT_TDATA
+                        : c.gsect[gi] == G_TBSS ? (uint16_t)SECT_TBSS
                         : (uint16_t)SECT_BSS;
             /* Common: value is the alignment.  A real symbol: value is
              * the offset within its section. */
@@ -6312,27 +6395,35 @@ void codegen64(const IRModule *ir, EmitModule *out, int want_debug) {
             emit_module_add_reloc(out, c.gfix[i].at + 4, 4 /* PAGEOFF12 */,
                                   si, c.gfix[i].addend);
         }
-        /* Pointer slots in __data: ARM64_RELOC_UNSIGNED, addend in the
-         * eight bytes at the slot. */
+        /* Pointer slots in __data or __thread_data: ARM64_RELOC_UNSIGNED,
+         * addend in the eight bytes at the slot.  Which buffer holds those
+         * bytes depends on the section the initializer's variable is in. */
         for (size_t i = 0; i < c.npfix; i++) {
             int si = c64_undef_sym(out, ir, c.pfix[i].sym);
             int gi = c.pfix[i].gidx;
-            if (!c.gsect || gi < 0 || c.gsect[gi] != G_DATA) {
+            int gs = (c.gsect && gi >= 0) ? c.gsect[gi] : -1;
+            if (gs != G_DATA && gs != G_TDATA) {
                 die_at("<arm64>", 0, 0,
-                       "arm64 object file: pointer initializer is not in __data");
+                       "arm64 object file: pointer initializer is not in a "
+                       "writable section");
                 continue;
             }
+            Buffer *gb = (gs == G_TDATA) ? &out->tdata : &out->data;
             size_t off = c.goff[gi] + (size_t)c.pfix[i].slot_off;
-            if (off + 8 <= out->data.len) {
+            if (off + 8 <= gb->len) {
                 int64_t add = c.pfix[i].addend;
-                memcpy(out->data.data + off, &add, 8);
+                memcpy(gb->data + off, &add, 8);
             }
             if (c.pfix[i].sub) {
                 int subi = c64_undef_sym(out, ir, c.pfix[i].sub);
                 emit_module_add_data_reloc(out, off, 1 /* SUBTRACTOR */, subi, 0);
+                out->data_relocs[out->num_data_relocs - 1].shndx =
+                    (gs == G_TDATA) ? (uint16_t)SECT_TDATA : (uint16_t)SECT_DATA;
             }
             emit_module_add_data_reloc(out, off, 0 /* UNSIGNED */, si,
                                        c.pfix[i].addend);
+            out->data_relocs[out->num_data_relocs - 1].shndx =
+                (gs == G_TDATA) ? (uint16_t)SECT_TDATA : (uint16_t)SECT_DATA;
         }
         for (size_t i = 0; i < c.nxcall; i++) {
             int si = c64_undef_sym(out, ir, c.xcall[i].name);
