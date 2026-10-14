@@ -129,29 +129,42 @@ static int is_system_soname(const char *soname) {
     return strcmp(soname, "libc.so.6") == 0
         || strcmp(soname, "libm.so.6") == 0
         || strcmp(soname, "libdl.so.2") == 0
-        || strcmp(soname, "libpthread.so.0") == 0;
+        || strcmp(soname, "libpthread.so.0") == 0
+        || strcmp(soname, "libSystem.B.dylib") == 0;
 }
 
-/* Map a -l argument to a DT_NEEDED soname string (caller frees). */
-static char *soname_from_l(const char *arg) {
+/* Map a -l argument to a DT_NEEDED/LC_LOAD_DYLIB soname string (caller frees).
+ * On Mach-O targets, use .dylib extension; on ELF, use .so. */
+static char *soname_from_l(const char *arg, int is_macho) {
     if (!arg || !*arg) {
         fprintf(stderr, "fakecc: -l requires a library name\n");
         exit(1);
     }
     if (arg[0] == ':')
         return xstrdup(arg + 1);
-    /* Common glibc ABI sonames — `libNAME.so` is often a linker script. */
-    if (strcmp(arg, "c") == 0) return xstrdup("libc.so.6");
-    if (strcmp(arg, "m") == 0) return xstrdup("libm.so.6");
-    if (strcmp(arg, "dl") == 0) return xstrdup("libdl.so.2");
-    if (strcmp(arg, "pthread") == 0) return xstrdup("libpthread.so.0");
+    /* Common system library sonames — platform-specific. */
+    if (is_macho) {
+        /* macOS: libSystem.B.dylib covers libc, libm, libpthread, libdl. */
+        if (strcmp(arg, "c") == 0) return xstrdup("libSystem.B.dylib");
+        if (strcmp(arg, "m") == 0) return xstrdup("libSystem.B.dylib");
+        if (strcmp(arg, "dl") == 0) return xstrdup("libSystem.B.dylib");
+        if (strcmp(arg, "pthread") == 0) return xstrdup("libSystem.B.dylib");
+    } else {
+        /* Linux: glibc ABI sonames. */
+        if (strcmp(arg, "c") == 0) return xstrdup("libc.so.6");
+        if (strcmp(arg, "m") == 0) return xstrdup("libm.so.6");
+        if (strcmp(arg, "dl") == 0) return xstrdup("libdl.so.2");
+        if (strcmp(arg, "pthread") == 0) return xstrdup("libpthread.so.0");
+    }
     {
         size_t n = strlen(arg);
-        char *s = malloc(n + 8);
+        const char *ext = is_macho ? ".dylib" : ".so";
+        size_t ext_len = strlen(ext);
+        char *s = malloc(3 + n + ext_len + 1);
         if (!s) { fprintf(stderr, "fakecc: out of memory\n"); exit(1); }
         memcpy(s, "lib", 3);
         memcpy(s + 3, arg, n);
-        memcpy(s + 3 + n, ".so", 4);
+        memcpy(s + 3 + n, ext, ext_len + 1);
         return s;
     }
 }
@@ -324,6 +337,35 @@ int main(int argc, char **argv) {
     const char *target_arg = NULL;   /* explicit --target value, or host default */
     int x86_vec_enable = 0;          /* -mavx / -mavx512f explicitly requested */
 
+    /* Pre-scan for --target so library name resolution (-l, .so/.dylib) can be
+     * target-aware before the main argument parsing loop. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--target") == 0 ||
+            strcmp(argv[i], "-target") == 0) {
+            if (i + 1 < argc) target_arg = argv[i + 1];
+        } else if (strncmp(argv[i], "--target=", 9) == 0) {
+            target_arg = argv[i] + 9;
+        } else if (strncmp(argv[i], "-target=", 8) == 0) {
+            target_arg = argv[i] + 8;
+        }
+    }
+    /* Resolve target early for library extension selection. */
+    const TargetDesc *target;
+    if (target_arg) {
+        target = target_parse(target_arg);
+        if (!target) {
+            fprintf(stderr,
+                    "fakecc: unrecognized target triple '%s' "
+                    "(supported: x86_64-linux, arm64-macos)\n",
+                    target_arg);
+            exit(1);
+        }
+    } else {
+        target = target_default();
+    }
+    target_set_current(target);
+    int is_macho = (target->objfmt == TARGET_OBJFMT_MACHO);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0) {
             compile_only = 1;
@@ -387,18 +429,45 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-l") == 0) {
             if (i + 1 >= argc) usage();
             needed = realloc(needed, ((size_t)num_needed + 1) * sizeof(char *));
-            needed[num_needed++] = soname_from_l(argv[++i]);
+            needed[num_needed++] = soname_from_l(argv[++i], is_macho);
         } else if (argv[i][0] == '-' && argv[i][1] == 'l') {
             needed = realloc(needed, ((size_t)num_needed + 1) * sizeof(char *));
-            needed[num_needed++] = soname_from_l(argv[i] + 2);
-        } else if (ends_with(argv[i], ".so")) {
-            /* Pass a .so path: DT_NEEDED = basename; its dir joins -L/RUNPATH. */
+            needed[num_needed++] = soname_from_l(argv[i] + 2, is_macho);
+        } else if (ends_with(argv[i], ".so") || ends_with(argv[i], ".dylib")) {
+            /* Pass a .so/.dylib path: DT_NEEDED/LC_LOAD_DYLIB = basename;
+             * its dir joins -L/RUNPATH/LC_RPATH. */
             needed = realloc(needed, ((size_t)num_needed + 1) * sizeof(char *));
             needed[num_needed++] = soname_from_so_path(argv[i]);
             {
                 char *d = dir_of(argv[i]);
                 paths_add(&lib_paths, &num_lib_paths, d);
                 free(d);
+            }
+        } else if (strncmp(argv[i], "-Wl,", 4) == 0) {
+            /* Pass linker options through: -Wl,-rpath,/path etc. */
+            const char *opt = argv[i] + 4;
+            /* Parse comma-separated linker options. */
+            while (*opt) {
+                if (strncmp(opt, "-rpath,", 7) == 0) {
+                    opt += 7;
+                    /* rpath value runs until next comma or end. */
+                    const char *end = strchr(opt, ',');
+                    size_t len = end ? (size_t)(end - opt) : strlen(opt);
+                    char *rpath = malloc(len + 1);
+                    if (!rpath) { fprintf(stderr, "fakecc: out of memory\n"); exit(1); }
+                    memcpy(rpath, opt, len);
+                    rpath[len] = '\0';
+                    /* Store rpath for later use (add to lib_paths for RUNPATH). */
+                    paths_add(&lib_paths, &num_lib_paths, rpath);
+                    free(rpath);
+                    opt += len;
+                    if (*opt == ',') opt++;
+                } else {
+                    /* Skip unknown linker options silently (gcc-like). */
+                    const char *end = strchr(opt, ',');
+                    if (end) opt = end + 1;
+                    else break;
+                }
             }
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "fakecc: unknown option '%s'\n", argv[i]);
@@ -410,23 +479,6 @@ int main(int argc, char **argv) {
     }
 
     if (ninputs == 0 || output_path == NULL) usage();
-
-    /* Resolve the compilation target (explicit --target or host default)
-     * before any real work starts. */
-    const TargetDesc *target;
-    if (target_arg) {
-        target = target_parse(target_arg);
-        if (!target) {
-            fprintf(stderr,
-                    "fakecc: unrecognized target triple '%s' "
-                    "(supported: x86_64-linux, arm64-macos)\n",
-                    target_arg);
-            exit(1);
-        }
-    } else {
-        target = target_default();
-    }
-    target_set_current(target);
 
     /* x86-only vector-width switches: arm64 always passes 16-byte NEON
      * vectors; -mavx/-mavx512f are meaningless there.  The -mno-* forms
@@ -684,7 +736,8 @@ int main(int argc, char **argv) {
     }
 
     emit_link(mod_ptrs, (size_t)nmods, output_path,
-              (const char **)needed, (size_t)num_needed, nodefaultlibs,
+              (const char **)needed, (size_t)num_needed,
+              nodefaultlibs || nostdlib,
               (const char **)lib_paths, (size_t)num_lib_paths, want_debug,
               is_shared);
 

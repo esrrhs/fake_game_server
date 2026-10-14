@@ -268,7 +268,8 @@ jobs:
 
   # macOS e2e suites: same coverage as Linux bootstrap-suite, but using the
   # host-built compiler (bootstrap on arm64 hits a conditional-branch-range
-  # limitation that is being investigated separately).
+  # limitation that is being investigated separately). Uses clang as the
+  # difftest oracle (instead of gcc on Linux).
   macos-suite:
     name: macos · ${{ matrix.label }}
     runs-on: macos-latest
@@ -281,6 +282,12 @@ jobs:
             opt: -O0
           - label: e2e -O1
             opt: -O1
+          - label: difftest -O0
+            opt: -O0
+            suite: difftest
+          - label: difftest -O1
+            opt: -O1
+            suite: difftest
           - label: multi/cli/compile/ports
             opt: ""
     steps:
@@ -296,6 +303,9 @@ jobs:
           case "${{ matrix.label }}" in
             e2e*)
               CC_TIMEOUT=300 bash test/e2e/run_e2e.sh build/fakecc ${{ matrix.opt }}
+              ;;
+            difftest*)
+              CC_TIMEOUT=300 bash test/e2e/run_difftest.sh build/fakecc ${{ matrix.opt }} --oracle clang
               ;;
             multi/cli/compile/ports)
               bash test/e2e/run_multi_e2e.sh build/fakecc -O0

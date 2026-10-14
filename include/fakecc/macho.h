@@ -20,9 +20,11 @@ struct EmitModule;
 /* Write an arm64 Mach-O PIE executable from an emitted module:
  *   __TEXT : __text + __const (read-only globals/string literals)
  *   __DATA : __data (initialized globals) + __bss (zero-fill)
- * LC_MAIN entry_off is a file offset within __text. */
+ * LC_MAIN entry_off is a file offset within __text.
+ * If skip_libsystem is non-zero, omit the LC_LOAD_DYLIB for libSystem
+ * (used for -nostdlib/-nodefaultlibs freestanding builds). */
 int macho_write_exec(const struct EmitModule *em, uint64_t entry_off,
-                     const char *path);
+                     const char *path, int skip_libsystem);
 
 /* Relocatable MH_OBJECT.  Defined symbols are recorded; intra-section
  * branches are already resolved.  Global-address relocations are not
@@ -35,8 +37,10 @@ int macho_read_object(const char *path, struct EmitModule *em);
 
 /* Link object modules (each produced by -c) into one PIE executable.
  * Resolves BRANCH26, PAGE21/PAGEOFF12 and UNSIGNED against defined
- * symbols, then writes and returns 0.  The caller still ad-hoc signs. */
-int macho_link_objects(struct EmitModule **mods, size_t n, const char *path);
+ * symbols, then writes and returns 0.  The caller still ad-hoc signs.
+ * If skip_libsystem is non-zero, omit the LC_LOAD_DYLIB for libSystem. */
+int macho_link_objects(struct EmitModule **mods, size_t n, const char *path,
+                       int skip_libsystem);
 
 /* Single-__text convenience used by low-level encoder tests. */
 int macho_write_exec_text(const Buffer *text, uint64_t entry_off,

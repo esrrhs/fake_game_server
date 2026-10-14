@@ -1,8 +1,10 @@
 // expect: 0
+// skip_oracle: clang
 /* Integer literal typing on LP64: hex/octal wrap at 64 bits; decimal uses
  * the full 128-bit range (int → long → long long → __int128 → unsigned
  * __int128).  Values >= 2^64 are written with shifts so the test behaves
- * identically under both gcc (which wraps) and fakecc (which promotes). */
+ * identically under both gcc (which wraps) and fakecc (which promotes).
+ * Clang rejects hex literals > 2^64-1 outright, so skip under clang. */
 package main;
 
 int main(void) {

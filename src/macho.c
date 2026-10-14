@@ -508,13 +508,13 @@ int macho_write_exec_text(const Buffer *text, uint64_t entry_off,
     memset(&em, 0, sizeof em);
     buffer_init(&em.text);
     buffer_append(&em.text, text->data, text->len);
-    int rc = macho_write_exec(&em, entry_off, path);
+    int rc = macho_write_exec(&em, entry_off, path, 0);
     buffer_free(&em.text);
     return rc;
 }
 
 int macho_write_exec(const EmitModule *em, uint64_t entry_off,
-                     const char *path) {
+                     const char *path, int skip_libsystem) {
     const Buffer *text = &em->text;
     const Buffer *rodata = &em->rodata;
     const Buffer *data = &em->data;
@@ -614,16 +614,17 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     const uint32_t dylib_cmdsz =
         align8(dylib_name_off + (uint32_t)strlen(LIBSYSTEM_PATH) + 1);
 
-    /* PAGEZERO, __TEXT, [__DATA], __LINKEDIT + the five non-segment
-     * commands (build version, uuid, main, dylinker, dylib).
+    /* PAGEZERO, __TEXT, [__DATA], __LINKEDIT + the non-segment commands
+     * (build version, uuid, main, dylinker, [dylib if !skip_libsystem]).
      * Pointer initializers add LC_DYLD_CHAINED_FIXUPS and an empty
      * LC_DYLD_EXPORTS_TRIE (dyld wants the pair). */
-    const uint32_t ncmds = (data_present ? 4u : 3u) + 5u + (has_fix ? 2u : 0u);
+    const uint32_t n_dylib_cmds = skip_libsystem ? 0u : 1u;
+    const uint32_t ncmds = (data_present ? 4u : 3u) + 4u + n_dylib_cmds + (has_fix ? 2u : 0u);
     const uint32_t uuid_cmd = 24;
     const uint32_t sizeofcmds =
         seg_plain_cmd + seg_text_cmd + seg_data_cmd + seg_plain_cmd
         + build_cmd + uuid_cmd + main_cmd
-        + dylinker_cmdsz + dylib_cmdsz
+        + dylinker_cmdsz + (skip_libsystem ? 0 : dylib_cmdsz)
         + (has_fix ? 32u : 0u);
 
     const uint32_t cmds_end = (uint32_t)sizeof(mach_header_64) + sizeofcmds;
@@ -850,15 +851,17 @@ int macho_write_exec(const EmitModule *em, uint64_t entry_off,
     APPEND_BYTES(DYLINKER_PATH, strlen(DYLINKER_PATH) + 1);
     APPEND_ZERO(dylinker_cmdsz - dylinker_name_off - strlen(DYLINKER_PATH) - 1);
 
-    /* ── LC_LOAD_DYLIB (libSystem; zero imports are legal) ── */
-    dylib_command dc;
-    memset(&dc, 0, sizeof dc);
-    dc.cmd = LC_LOAD_DYLIB;
-    dc.cmdsize = dylib_cmdsz;
-    dc.dylib.name_offset = dylib_name_off;
-    APPEND_BYTES(&dc, 24); /* offsetof(dylib_command, name) — fakecc dialect has no offsetof */
-    APPEND_BYTES(LIBSYSTEM_PATH, strlen(LIBSYSTEM_PATH) + 1);
-    APPEND_ZERO(dylib_cmdsz - dylib_name_off - strlen(LIBSYSTEM_PATH) - 1);
+    /* ── LC_LOAD_DYLIB (libSystem; omitted for -nostdlib/-nodefaultlibs) ── */
+    if (!skip_libsystem) {
+        dylib_command dc;
+        memset(&dc, 0, sizeof dc);
+        dc.cmd = LC_LOAD_DYLIB;
+        dc.cmdsize = dylib_cmdsz;
+        dc.dylib.name_offset = dylib_name_off;
+        APPEND_BYTES(&dc, 24); /* offsetof(dylib_command, name) — fakecc dialect has no offsetof */
+        APPEND_BYTES(LIBSYSTEM_PATH, strlen(LIBSYSTEM_PATH) + 1);
+        APPEND_ZERO(dylib_cmdsz - dylib_name_off - strlen(LIBSYSTEM_PATH) - 1);
+    }
 
     /* ── __TEXT segment file bytes: pad → text → __const → page ── */
     while (out.len < text_off) APPEND_ZERO((size_t)(text_off - out.len));
@@ -2124,7 +2127,8 @@ static size_t macho_symbol_span(const EmitModule *m, uint16_t sh, size_t off) {
 }
 
 /* One relocating link of -c modules into a PIE image. */
-int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
+int macho_link_objects(EmitModule **mods, size_t n, const char *path,
+                       int skip_libsystem) {
     if (!n) {
         fprintf(stderr, "fakecc: no modules to link\n");
         return -1;
@@ -2997,7 +3001,7 @@ int macho_link_objects(EmitModule **mods, size_t n, const char *path) {
             memcpy(out.text.data + dtor_at[i], &w, 4);
         }
         if (rc == 0)
-            rc = macho_write_exec(&out, macho_text_offset(), path);
+            rc = macho_write_exec(&out, macho_text_offset(), path, skip_libsystem);
     }
 
     for (size_t i = 0; i < n; i++) free(adj[i]);

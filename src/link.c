@@ -1068,10 +1068,12 @@ void emit_link(EmitModule **mods, size_t n, const char *path,
         for (size_t i = 0; i < n; i++)
             if (mods[i]->num_syms) from_objects = 1;
         int rc;
+        /* -nostdlib or -nodefaultlibs: skip the libSystem LC_LOAD_DYLIB. */
+        int skip_libsystem = nodefaultlibs;
         if (from_objects)
-            rc = macho_link_objects(mods, n, path);
+            rc = macho_link_objects(mods, n, path, skip_libsystem);
         else
-            rc = macho_write_exec(mods[0], macho_text_offset(), path);
+            rc = macho_write_exec(mods[0], macho_text_offset(), path, skip_libsystem);
         if (rc != 0) exit(1);
         if (macho_codesign(path) != 0) exit(1);
         return;

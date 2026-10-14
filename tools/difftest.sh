@@ -11,21 +11,27 @@
 # Input files are in the fakecc dialect (a leading `package main;`); the line
 # is stripped before handing the source to gcc.
 set -uo pipefail
+# Portability helpers (timeout shim for non-GNU hosts).
+_COMPAT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../test" && pwd)
+. "$_COMPAT_DIR/compat.sh" || { echo "cannot source compat.sh from $_COMPAT_DIR" >&2; exit 2; }
 
 FAKECC=${FAKECC:-./build/fakecc}
 RUN_TIMEOUT=${RUN_TIMEOUT:-10}
-# Flags for fakecc only: gcc stays the unmodified oracle regardless of the
+# Flags for fakecc only: the oracle stays unmodified regardless of the
 # optimization level we are exercising.
 FCC_FLAGS=${FCC_FLAGS:-}
+# Oracle compiler: gcc on Linux, clang on macOS (both understand gnu99).
+ORACLE=${ORACLE:-gcc}
 
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 
-while getopts "c:f:j:" opt; do
+while getopts "c:f:o:j:" opt; do
     case "$opt" in
         c) FAKECC=$OPTARG ;;
         f) FCC_FLAGS=$OPTARG ;;
+        o) ORACLE=$OPTARG ;;
         j) JOBS=$OPTARG ;;
-        *) echo "usage: $0 [-c FAKECC] [-f FLAGS] [-j JOBS] file.c ..." >&2; exit 2 ;;
+        *) echo "usage: $0 [-c FAKECC] [-f FLAGS] [-o ORACLE] [-j JOBS] file.c ..." >&2; exit 2 ;;
     esac
 done
 shift $((OPTIND - 1))
@@ -35,7 +41,10 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 TOOLS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-export FAKECC RUN_TIMEOUT FCC_FLAGS WORK TOOLS_DIR
+export FAKECC RUN_TIMEOUT FCC_FLAGS WORK TOOLS_DIR ORACLE
+# The worker subshell only sees exported functions; re-export the timeout
+# shim from compat.sh so it is available inside difftest_one.
+export -f timeout nproc 2>/dev/null || true
 
 difftest_one() {
     local src="$1"
@@ -120,7 +129,7 @@ difftest_one() {
     # Do not pass -Wno-*-declaration-missing-parameter-type: that option
     # exists only on GCC 14+, and unknown -Wno-error=* is a hard error on
     # Ubuntu 24.04's GCC 13.  K&R forwards are rewritten in gcc_stdarg_prep.py.
-    if ! gcc -std=gnu99 -D_GNU_SOURCE \
+    if ! $ORACLE -std=gnu99 -D_GNU_SOURCE \
             -Wno-error=int-conversion -Wno-error=implicit-int \
             -Wno-error=incompatible-pointer-types \
             $extra_flags -o "$WORK/$name.gcc" "$WORK/$name.gcc.c" -lm 2>"$WORK/$name.gcc.err" \
@@ -177,11 +186,11 @@ src = re.sub(r"typedef\s+struct\s+FILE\s+FILE\s*;", "", src)
 sys.stdout.buffer.write(src.encode("latin-1"))
 PY
         } > "$WORK/$name.gcc.c"
-        if ! gcc -std=gnu99 -D_GNU_SOURCE -w \
+        if ! $ORACLE -std=gnu99 -D_GNU_SOURCE -w \
                 -Wno-error=int-conversion -Wno-error=implicit-int \
                 -Wno-error=incompatible-pointer-types \
                 $extra_flags -o "$WORK/$name.gcc" "$WORK/$name.gcc.c" -lm 2>"$WORK/$name.gcc.err"; then
-            printf '%-28s FAIL (gcc rejected: %s)\n' "$base" "$(head -1 "$WORK/$name.gcc.err")"
+            printf '%-28s FAIL (%s rejected: %s)\n' "$base" "$ORACLE" "$(head -1 "$WORK/$name.gcc.err")"
             return 1
         fi
     fi

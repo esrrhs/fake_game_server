@@ -136,9 +136,16 @@ foreach(lvl O0 O1)
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # gcc-oracle differential suite over a curated e2e manifest.
-    add_test(NAME difftest_${lvl}
-             COMMAND bash ${CMAKE_SOURCE_DIR}/test/e2e/run_difftest.sh $<TARGET_FILE:fakecc> -${lvl}
-             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # macOS uses clang as the oracle (no gcc on CI runners).
+    if(APPLE)
+        add_test(NAME difftest_${lvl}
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/test/e2e/run_difftest.sh $<TARGET_FILE:fakecc> -${lvl} --oracle clang
+                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    else()
+        add_test(NAME difftest_${lvl}
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/test/e2e/run_difftest.sh $<TARGET_FILE:fakecc> -${lvl}
+                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    endif()
 
     # Shared-library linking: -l / -l: / -nodefaultlibs / .so path.
     add_test(NAME e2e_shlib_${lvl}
